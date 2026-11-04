@@ -1,28 +1,34 @@
-"""Lists nuclei-templates files added/modified since a release, between two release tags, using the GitHub compare API."""
+"""Finds nuclei-templates files changed between two release tags, using the GitHub API."""
 
 import json
 import os
+import re
 from typing import Callable, Optional, Set, Tuple
 
 import requests
 
-from cybercover.modules.cybercover_nuclei_configuration import (
-    ChangeType,
-    parse_version,
-)
-
 REPO = os.environ.get("CYBERCOVER_TEMPLATES_REPO", "projectdiscovery/nuclei-templates")
 API = "https://api.github.com"
 TEMPLATES_CONFIG_PATH = os.path.expanduser("~/.config/nuclei/.templates-config.json")
-PER_PAGE = 100
 COMPARE_FILES_LIMIT = 300  # GitHub returns at most this many files from /compare
-
-ADDED_STATUSES = {"added", "renamed"}
-MODIFIED_STATUSES = {"modified", "changed", "copied"}
+VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+CHANGED_STATUSES = {"added", "renamed", "modified", "changed", "copied"}
 
 
 class TemplateLookupError(Exception):
     pass
+
+
+class TooManyChangesError(TemplateLookupError):
+    """The gap is too big for the compare API: the caller should fall back to a full scan."""
+
+
+def parse_version(value: object) -> Tuple[int, int, int]:
+    """Parses a nuclei-templates release tag such as ``v10.5.1``."""
+    match = VERSION_RE.match(value) if isinstance(value, str) else None
+    if not match:
+        raise ValueError(f"Invalid templates version: {value!r} (expected e.g. 'v10.5.1')")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
 def installed_templates_version(path: str = TEMPLATES_CONFIG_PATH) -> Optional[str]:
@@ -46,57 +52,78 @@ def _get(session: requests.Session, url: str, **params: object) -> object:
         raise TemplateLookupError(f"GitHub request failed: {url}: {exc}") from exc
 
 
+def previous_release(head: str, session: Optional[requests.Session] = None) -> str:
+    """The newest nuclei-templates release older than ``head``."""
+    session = session or requests.Session()
+    head_version = parse_version(head)
+    releases = _get(session, f"{API}/repos/{REPO}/releases", per_page=100)
+    if not isinstance(releases, list):
+        raise TemplateLookupError("Unexpected GitHub releases response")
+    older = [
+        item["tag_name"]
+        for item in releases
+        if isinstance(item, dict)
+        and VERSION_RE.match(str(item.get("tag_name")))
+        and parse_version(item["tag_name"]) < head_version
+    ]
+    if not older:
+        raise TemplateLookupError(f"No release older than {head} found")
+    return max(older, key=parse_version)
+
+
 def fetch_changed_templates(
     after_version: str,
-    change_type: ChangeType,
-    head: Optional[str],
+    head: str,
     session: Optional[requests.Session] = None,
-) -> Tuple[Set[str], str]:
-    """Return changed paths between ``after_version`` and the installed release, plus the covered version.
-
-    If the client's version is not older than the installed one, nothing changed from our
-    point of view; the installed version is returned so the caller retries from it.
-    """
+) -> Set[str]:
+    """Paths of templates added or modified between ``after_version`` and ``head``."""
     session = session or requests.Session()
-    if not head:
-        raise TemplateLookupError("Unable to determine the installed nuclei-templates release")
-    try:
-        if parse_version(after_version) >= parse_version(head):
-            return set(), head
-    except ValueError as exc:
-        raise TemplateLookupError(str(exc)) from exc
-
-    data = _get(session, f"{API}/repos/{REPO}/compare/{after_version}...{head}", per_page=PER_PAGE, page=1)
+    data = _get(session, f"{API}/repos/{REPO}/compare/{after_version}...{head}", per_page=100, page=1)
     if not isinstance(data, dict):
         raise TemplateLookupError("Unexpected GitHub compare response")
     files = data.get("files", [])
-    # /compare returns at most 300 files in total (later pages are empty), so a full page may be truncated
+    # /compare returns at most 300 files in total (later pages are empty), so a full list may be truncated
     if len(files) >= COMPARE_FILES_LIMIT:
-        raise TemplateLookupError(
-            f"Too many changed files between {after_version} and {head}, refusing a partial list - run a full scan"
-        )
-    wanted = ADDED_STATUSES if change_type == ChangeType.ADDED else ADDED_STATUSES | MODIFIED_STATUSES
-    paths = {
+        raise TooManyChangesError(f"Too many changed files between {after_version} and {head}")
+    return {
         item["filename"]
         for item in files
-        if item.get("status") in wanted and item["filename"].endswith((".yaml", ".yml"))
+        if item.get("status") in CHANGED_STATUSES and item["filename"].endswith((".yaml", ".yml"))
     }
-    return paths, head
 
 
 def get_changed_templates(
     after_version: str,
-    change_type: ChangeType,
-    head: Optional[str],
+    head: str,
     cache_get: Callable[[str], Optional[bytes]],
     cache_set: Callable[[str, bytes], None],
-) -> Tuple[Set[str], str]:
-    """Cached wrapper (Artemis RedisCache): every scan with the same versions shares one lookup."""
-    key = f"v3:{after_version}:{change_type.value}:{head}"
+) -> Set[str]:
+    """Cached wrapper (Artemis RedisCache): scans with the same versions share one lookup."""
+    key = f"v4:{after_version}:{head}"
     cached = cache_get(key)
     if cached is not None:
         value = json.loads(cached)
-        return set(value["templates"]), value["covered_until"]
-    templates, covered_until = fetch_changed_templates(after_version, change_type, head)
-    cache_set(key, json.dumps({"templates": sorted(templates), "covered_until": covered_until}).encode("utf-8"))
-    return templates, covered_until
+        if value.get("too_many"):
+            raise TooManyChangesError(f"Too many changed files between {after_version} and {head}")
+        return set(value["templates"])
+    try:
+        templates = fetch_changed_templates(after_version, head)
+    except TooManyChangesError:
+        cache_set(key, json.dumps({"too_many": True}).encode("utf-8"))
+        raise
+    cache_set(key, json.dumps({"templates": sorted(templates)}).encode("utf-8"))
+    return templates
+
+
+def get_previous_release(
+    head: str,
+    cache_get: Callable[[str], Optional[bytes]],
+    cache_set: Callable[[str, bytes], None],
+) -> str:
+    key = f"v4:previous:{head}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached.decode("utf-8")
+    result = previous_release(head)
+    cache_set(key, result.encode("utf-8"))
+    return result
