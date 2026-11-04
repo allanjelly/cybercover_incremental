@@ -1,13 +1,13 @@
-import datetime
 import enum
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, Optional, Tuple
 
 from artemis.modules.runtime_configuration.nuclei_configuration import (
     NucleiConfiguration,
     SeverityThreshold,
 )
 
-MAX_DAYS_BACK = 30
+VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 
 class ChangeType(enum.Enum):
@@ -15,26 +15,12 @@ class ChangeType(enum.Enum):
     ADDED_OR_MODIFIED = "added_or_modified"
 
 
-def today_utc() -> datetime.date:
-    return datetime.datetime.now(datetime.timezone.utc).date()
-
-
-def parse_after(value: Any) -> datetime.date:
-    """Parses ``YYYY-MM-DD`` (or an ISO 8601 datetime, converted to its UTC date)."""
-    if isinstance(value, datetime.datetime):
-        parsed = value
-    elif isinstance(value, datetime.date):
-        return value
-    elif isinstance(value, str):
-        try:
-            parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError(f"Invalid 'after' value: {value!r}") from exc
-    else:
-        raise ValueError(f"Invalid 'after' value: {value!r}")
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(datetime.timezone.utc)
-    return parsed.date()
+def parse_version(value: Any) -> Tuple[int, int, int]:
+    """Parses a nuclei-templates release tag such as ``v10.5.1``."""
+    match = VERSION_RE.match(value) if isinstance(value, str) else None
+    if not match:
+        raise ValueError(f"Invalid templates version: {value!r} (expected e.g. 'v10.5.1')")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
 class CybercoverNucleiConfiguration(NucleiConfiguration):
@@ -42,26 +28,27 @@ class CybercoverNucleiConfiguration(NucleiConfiguration):
     Runtime configuration of the cybercover_nuclei module.
 
     Attributes:
-        after: only templates added/modified on or after this UTC date are run.
+        after_version: nuclei-templates release (e.g. "v10.5.1") of the previous scan; only templates
+            added/modified after it are run.
         change_type: whether to consider only new templates or also modified ones.
         severity_threshold: inherited from NucleiConfiguration.
     """
 
-    KEYS = {"after", "change_type", "severity_threshold"}
+    KEYS = {"after_version", "change_type", "severity_threshold"}
 
     def __init__(
         self,
-        after: Optional[datetime.date] = None,
+        after_version: Optional[str] = None,
         change_type: ChangeType = ChangeType.ADDED_OR_MODIFIED,
         severity_threshold: SeverityThreshold = SeverityThreshold.HIGH_AND_ABOVE,
     ) -> None:
         super().__init__(severity_threshold=severity_threshold)
-        self.after = after
+        self.after_version = after_version
         self.change_type = change_type
 
     def serialize(self) -> Dict[str, Any]:
         result = super().serialize()
-        result["after"] = self.after.isoformat() if self.after else None
+        result["after_version"] = self.after_version
         result["change_type"] = self.change_type.value
         return result
 
@@ -71,9 +58,8 @@ class CybercoverNucleiConfiguration(NucleiConfiguration):
         if unexpected:
             raise KeyError(f"Unexpected keys in {config_dict}: {sorted(unexpected)}")
 
-        after_raw = config_dict.get("after")
         return cls(
-            after=parse_after(after_raw) if after_raw is not None else None,
+            after_version=config_dict.get("after_version"),
             change_type=ChangeType(config_dict.get("change_type", ChangeType.ADDED_OR_MODIFIED.value)),
             severity_threshold=SeverityThreshold(
                 config_dict.get("severity_threshold", SeverityThreshold.HIGH_AND_ABOVE.value)
@@ -81,7 +67,10 @@ class CybercoverNucleiConfiguration(NucleiConfiguration):
         )
 
     def validate(self) -> bool:
-        if not super().validate() or not isinstance(self.change_type, ChangeType) or self.after is None:
+        if not super().validate() or not isinstance(self.change_type, ChangeType) or self.after_version is None:
             return False
-        today = today_utc()
-        return today - datetime.timedelta(days=MAX_DAYS_BACK) <= self.after <= today
+        try:
+            parse_version(self.after_version)
+        except ValueError:
+            return False
+        return True

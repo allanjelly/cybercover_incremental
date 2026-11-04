@@ -1,4 +1,3 @@
-import datetime
 from unittest import mock
 
 import pytest
@@ -12,40 +11,33 @@ from cybercover.github_templates import (
 from cybercover.modules.cybercover_nuclei_configuration import (
     ChangeType,
     CybercoverNucleiConfiguration,
-    parse_after,
-    today_utc,
+    parse_version,
 )
 
-DAY = datetime.timedelta(days=1)
-
-
 def test_config_roundtrip_and_validation():
-    yesterday = (today_utc() - DAY).isoformat()
-    config = CybercoverNucleiConfiguration.deserialize({"after": yesterday})
-    assert config.after == today_utc() - DAY
+    config = CybercoverNucleiConfiguration.deserialize({"after_version": "v10.5.0"})
+    assert config.after_version == "v10.5.0"
     assert config.validate()
     assert CybercoverNucleiConfiguration.deserialize(config.serialize()).serialize() == config.serialize()
 
 
 @pytest.mark.parametrize(
     "bad",
-    [{"after": "yesterday"}, {"after": "2026-11-01", "x": 1}, {"after": "2026-11-01", "change_type": "all"}],
+    [{"after": "2026-11-01"}, {"after_version": "v10.5.0", "x": 1}, {"after_version": "v10.5.0", "change_type": "all"}],
 )
 def test_config_rejects(bad):
-    with pytest.raises((ValueError, KeyError)):
+    with pytest.raises((KeyError, ValueError)):
         CybercoverNucleiConfiguration.deserialize(bad)
 
 
-def test_config_after_range():
-    assert not CybercoverNucleiConfiguration().validate()
-    assert not CybercoverNucleiConfiguration(after=today_utc() + DAY).validate()
-    assert not CybercoverNucleiConfiguration(after=today_utc() - 31 * DAY).validate()
-    assert CybercoverNucleiConfiguration(after=today_utc() - 30 * DAY).validate()
-    assert CybercoverNucleiConfiguration(after=today_utc()).validate()
+@pytest.mark.parametrize("bad", [None, "10.5.0", "v10.5", "latest", "v10.5.0; rm"])
+def test_config_validation_rejects_bad_version(bad):
+    assert not CybercoverNucleiConfiguration(after_version=bad).validate()
 
 
-def test_parse_after_datetime_becomes_utc_date():
-    assert parse_after("2026-11-01T23:30:00-02:00") == datetime.date(2026, 11, 2)
+def test_parse_version_orders_numerically():
+    assert parse_version("v10.5.1") > parse_version("v9.9.9")
+    assert parse_version("v10.10.0") > parse_version("v10.9.0")
 
 
 class FakeSession:
@@ -68,63 +60,49 @@ def _files(*items):
 
 def test_fetch_changed_templates_filters_by_status():
     def responses(url, params):
-        if url.endswith("/commits/v10.0.0"):
-            return {"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}
-        if url.endswith("/commits"):
-            assert params["until"].startswith("2026-11-03T00:00:00")
-            return [{"sha": "base123"}]
-        assert url.endswith("/compare/base123...v10.0.0")
+        assert url.endswith("/compare/v10.4.0...v10.5.0")
         return {
             "files": _files(
                 ("http/a.yaml", "added"),
                 ("http/b.yaml", "modified"),
-                ("http/c.yaml", "removed"),
-                ("http/d.yaml", "renamed"),
+                ("http/c.yaml", "renamed"),
+                ("http/d.yaml", "removed"),
                 ("README.md", "added"),
             )
         }
 
     session = FakeSession(responses)
-    after = datetime.date(2026, 11, 3)
-    assert fetch_changed_templates(after, ChangeType.ADDED, "v10.0.0", session) == (
-        {"http/a.yaml", "http/d.yaml"},
-        datetime.date(2026, 11, 5),
+    assert fetch_changed_templates("v10.4.0", ChangeType.ADDED, "v10.5.0", session) == (
+        {"http/a.yaml", "http/c.yaml"},
+        "v10.5.0",
     )
-    assert fetch_changed_templates(after, ChangeType.ADDED_OR_MODIFIED, "v10.0.0", session) == (
-        {"http/a.yaml", "http/b.yaml", "http/d.yaml"},
-        datetime.date(2026, 11, 5),
-    )
+    assert fetch_changed_templates("v10.4.0", ChangeType.ADDED_OR_MODIFIED, "v10.5.0", session)[0] == {
+        "http/a.yaml",
+        "http/b.yaml",
+        "http/c.yaml",
+    }
 
 
-def test_fetch_newer_after_returns_older_coverage_without_diff():
-    def responses(url, params):
-        assert url.endswith("/commits/v1")
-        return {"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}
-
-    session = FakeSession(responses)
-    assert fetch_changed_templates(
-        datetime.date(2026, 11, 6), ChangeType.ADDED_OR_MODIFIED, "v1", session
-    ) == (set(), datetime.date(2026, 11, 5))
-    assert len(session.calls) == 1
+@pytest.mark.parametrize("after", ["v10.5.0", "v10.6.0"])
+def test_fetch_same_or_newer_version_returns_installed_without_diff(after):
+    session = FakeSession(lambda url, params: pytest.fail("no request expected"))
+    assert fetch_changed_templates(after, ChangeType.ADDED_OR_MODIFIED, "v10.5.0", session) == (set(), "v10.5.0")
+    assert session.calls == []
 
 
-def test_fetch_paginates_and_refuses_partial_lists():
-    pages = {1: _files(*[(f"p1/{i}.yaml", "added") for i in range(100)]), 2: _files(("p2/x.yaml", "added"))}
-
-    def responses(url, params):
-        if url.endswith("/commits/v1"):
-            return {"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}
-        return [{"sha": "b"}] if url.endswith("/commits") else {"files": pages[params["page"]]}
-
-    assert len(fetch_changed_templates(datetime.date(2026, 11, 3), ChangeType.ADDED, "v1", FakeSession(responses))[0]) == 101
-
-    def too_many(url, params):
-        if url.endswith("/commits/v1"):
-            return {"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}
-        return [{"sha": "b"}] if url.endswith("/commits") else {"files": _files(*[(f"{params['page']}/{i}.yaml", "added") for i in range(100)])}
-
+def test_fetch_refuses_truncated_list():
+    full = {"files": _files(*[(f"http/{i}.yaml", "added") for i in range(300)])}
     with pytest.raises(TemplateLookupError):
-        fetch_changed_templates(datetime.date(2026, 11, 3), ChangeType.ADDED, "v1", FakeSession(too_many))
+        fetch_changed_templates("v10.4.0", ChangeType.ADDED, "v10.5.0", FakeSession(lambda u, p: full))
+    ok = {"files": _files(*[(f"http/{i}.yaml", "added") for i in range(299)])}
+    assert len(fetch_changed_templates("v10.4.0", ChangeType.ADDED, "v10.5.0", FakeSession(lambda u, p: ok))[0]) == 299
+
+
+def test_fetch_rejects_unknown_installed_or_invalid_version():
+    with pytest.raises(TemplateLookupError):
+        fetch_changed_templates("v10.4.0", ChangeType.ADDED, None, FakeSession(lambda u, p: {}))
+    with pytest.raises(TemplateLookupError):
+        fetch_changed_templates("bogus", ChangeType.ADDED, "v10.5.0", FakeSession(lambda u, p: {}))
 
 
 def test_fetch_errors_are_wrapped():
@@ -133,16 +111,16 @@ def test_fetch_errors_are_wrapped():
     session = mock.Mock()
     session.get.side_effect = requests.ConnectionError("boom")
     with pytest.raises(TemplateLookupError):
-        fetch_changed_templates(datetime.date(2026, 11, 3), ChangeType.ADDED, "v1", session)
+        fetch_changed_templates("v10.4.0", ChangeType.ADDED, "v10.5.0", session)
 
 
 def test_cache_is_used_for_second_lookup():
     store = {}
-    covered_until = datetime.date(2026, 11, 5)
+    covered_until = "v10.5.0"
     with mock.patch(
         "cybercover.github_templates.fetch_changed_templates", return_value=({"a.yaml"}, covered_until)
     ) as fetch:
-        args = (datetime.date(2026, 11, 3), ChangeType.ADDED, "v1", store.get, lambda k, v: store.__setitem__(k, v))
+        args = ("v10.4.0", ChangeType.ADDED, "v10.5.0", store.get, lambda k, v: store.__setitem__(k, v))
         assert get_changed_templates(*args) == ({"a.yaml"}, covered_until)
         assert get_changed_templates(*args) == ({"a.yaml"}, covered_until)
     assert fetch.call_count == 1
@@ -192,7 +170,7 @@ def test_run_multiple_reports_error_when_lookup_fails():
     module.cache = mock.Mock()
     module.save_task_result = mock.Mock()
     task = mock.Mock()
-    task.payload_persistent = {"module_runtime_configurations": {"cybercover_nuclei": {"after": today_utc().isoformat()}}}
+    task.payload_persistent = {"module_runtime_configurations": {"cybercover_nuclei": {"after_version": "v10.4.0"}}}
     with mock.patch("cybercover.modules.cybercover_nuclei.get_changed_templates", side_effect=TemplateLookupError("down")):
         module.run_multiple([task])
     assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.ERROR
@@ -202,9 +180,9 @@ def test_run_multiple_sets_changed_and_delegates():
     module = _module()
     module.cache = mock.Mock()
     task = mock.Mock()
-    task.payload_persistent = {"module_runtime_configurations": {"cybercover_nuclei": {"after": today_utc().isoformat()}}}
+    task.payload_persistent = {"module_runtime_configurations": {"cybercover_nuclei": {"after_version": "v10.4.0"}}}
     seen = {}
-    covered_until = today_utc() - DAY
+    covered_until = "v10.5.0"
     with mock.patch(
         "cybercover.modules.cybercover_nuclei.get_changed_templates",
         return_value=({"a.yaml"}, covered_until),
@@ -213,7 +191,7 @@ def test_run_multiple_sets_changed_and_delegates():
     ):
         module.run_multiple([task])
     assert seen["changed"] == {"a.yaml"}
-    task.add_payload.assert_called_once_with("covered_until", covered_until.isoformat(), persistent=True)
+    task.add_payload.assert_called_once_with("covered_until", covered_until, persistent=True)
     assert module._changed is None
 
 
@@ -223,7 +201,7 @@ def test_main_patches_artemis_api():
 
     calls = []
     wrapped = m.wrap_create_tasks(lambda *a, **k: calls.append(k))
-    cfg = {"cybercover_nuclei": {"after": "2026-11-01"}}
+    cfg = {"cybercover_nuclei": {"after_version": "v10.4.0"}}
     wrapped(["x"], disabled_modules=["port_scanner", "nuclei-router", "ssh_bruter", "cybercover_nuclei"], module_runtime_configurations=cfg)
     wrapped(["x"], disabled_modules=["ssh_bruter"])
     assert sorted(calls[0]["disabled_modules"]) == ["nuclei-module", "ssh_bruter"]

@@ -21,8 +21,8 @@ from cybercover.modules.cybercover_nuclei_configuration import (
 @load_risk_class.load_risk_class(load_risk_class.LoadRiskClass.HIGH)
 class CybercoverNuclei(Nuclei):
     """
-    Incremental Nuclei scan: runs only the standard templates added/modified on or after the
-    configured `after` date. Disabled by default - enable it explicitly through /api/add.
+    Incremental Nuclei scan: runs only the standard templates added/modified after the
+    configured `after_version` templates release. Disabled by default - enable it explicitly through /api/add.
     Custom templates and workflows are not part of incremental scans.
     """
 
@@ -66,10 +66,10 @@ class CybercoverNuclei(Nuclei):
     def run_multiple(self, tasks: List[Task]) -> None:
         configuration = self.get_runtime_configuration(tasks[0])
         try:
-            if configuration.after is None:
-                raise TemplateLookupError("cybercover_nuclei requires a valid 'after' value")
+            if configuration.after_version is None:
+                raise TemplateLookupError("cybercover_nuclei requires a valid 'after_version' value")
             self._changed, covered_until = get_changed_templates(
-                configuration.after,
+                configuration.after_version,
                 configuration.change_type,
                 installed_templates_version(),
                 self.cache.get,
@@ -82,12 +82,12 @@ class CybercoverNuclei(Nuclei):
             return
 
         for task in tasks:
-            task.add_payload("covered_until", covered_until.isoformat(), persistent=True)
+            task.add_payload("covered_until", covered_until, persistent=True)
 
         self.log.info(
-            "%d templates changed since %s (%s); installed templates cover through %s; scanning %d targets",
+            "%d templates changed since %s (%s); installed templates version %s; scanning %d targets",
             len(self._changed),
-            configuration.after,
+            configuration.after_version,
             configuration.change_type.value,
             covered_until,
             len(tasks),
