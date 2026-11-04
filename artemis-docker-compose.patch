@@ -1,0 +1,40 @@
+--- /tmp/compose.orig	2026-11-04 10:50:32.845916373 +0000
++++ docker-compose.yaml	2026-11-04 10:50:32.861916373 +0000
+@@ -113,10 +113,15 @@
+ 
+   web:
+     <<: [*logging, *artemis-build-or-image]
++    # cybercover: same entrypoint as the image's default CMD, but with cybercover_nuclei registered
++    command: "bash -c 'alembic upgrade head && uvicorn cybercover.main:app --host 0.0.0.0 --port 5000'"
+     env_file: .env
++    environment:
++      PYTHONPATH: /opt
+     ports: ["5000:5000"]
+     restart: always
+     volumes:
++      - ${CYBERCOVER_DIR:-./cybercover}:/opt/cybercover:ro
+       - data-web:/data
+       - ./output/autoreporter/:/opt/output/autoreporter
+       - ./archived-task-results/:/opt/archived-task-results/
+@@ -305,6 +310,21 @@
+       - "${DOCKER_COMPOSE_ADDITIONAL_SHARED_DIRECTORY:-./shared}:/shared/"
+       - data-nuclei-templates:/root/nuclei-templates
+       - data-nuclei-config:/root/.config/nuclei
++
++  karton-cybercover-nuclei:
++    <<: [*logging, *artemis-build-or-image]
++    command: "python3 -m cybercover.modules.cybercover_nuclei"
++    labels:
++      prometheus.port: "9001"
++    env_file: .env
++    environment:
++      PYTHONPATH: /opt
++    restart: always
++    volumes:
++      - ${CYBERCOVER_DIR:-./cybercover}:/opt/cybercover:ro
++      - "${DOCKER_COMPOSE_ADDITIONAL_SHARED_DIRECTORY:-./shared}:/shared/"
++      - data-nuclei-templates:/root/nuclei-templates
++      - data-nuclei-config:/root/.config/nuclei
+ 
+   karton-nuclei-router:
+     <<: [*logging, *artemis-build-or-image]
