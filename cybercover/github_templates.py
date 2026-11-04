@@ -3,7 +3,7 @@
 import datetime
 import json
 import os
-from typing import Callable, Optional, Set
+from typing import Callable, Optional, Set, Tuple
 
 import requests
 
@@ -44,16 +44,35 @@ def _get(session: requests.Session, url: str, **params: object) -> object:
         raise TemplateLookupError(f"GitHub request failed: {url}: {exc}") from exc
 
 
+def _commit_date(session: requests.Session, commitish: str) -> datetime.date:
+    data = _get(session, f"{API}/repos/{REPO}/commits/{commitish}")
+    try:
+        commit_date = data["commit"]["committer"]["date"]
+        return datetime.datetime.fromisoformat(commit_date.replace("Z", "+00:00")).astimezone(
+            datetime.timezone.utc
+        ).date()
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise TemplateLookupError(f"Unable to determine installed templates date for {commitish}") from exc
+
+
 def fetch_changed_templates(
     after: datetime.date,
     change_type: ChangeType,
     head: Optional[str],
     session: Optional[requests.Session] = None,
-) -> Set[str]:
-    """Paths of templates changed from the last commit before ``after`` up to ``head``
-    (the installed release tag; the default branch if unknown)."""
+) -> Tuple[Set[str], datetime.date]:
+    """Return changed paths and the UTC date of the installed templates commit.
+
+    The covered date describes the installed release, not today's date. If ``after``
+    is newer than that release, no diff is needed; returning the older watermark lets
+    the caller retry from it until a newer release is installed.
+    """
     session = session or requests.Session()
-    head = head or "HEAD"
+    if not head:
+        raise TemplateLookupError("Unable to determine the installed nuclei-templates release")
+    covered_until = _commit_date(session, head)
+    if after > covered_until:
+        return set(), covered_until
 
     until = datetime.datetime.combine(after, datetime.time.min, tzinfo=datetime.timezone.utc).isoformat()
     commits = _get(session, f"{API}/repos/{REPO}/commits", until=until, per_page=1)
@@ -81,7 +100,7 @@ def fetch_changed_templates(
         page += 1
     if num_files >= COMPARE_FILES_LIMIT:
         raise TemplateLookupError(f"Too many changed files since {after} ({num_files}+), refusing a partial list")
-    return paths
+    return paths, covered_until
 
 
 def get_changed_templates(
@@ -90,12 +109,16 @@ def get_changed_templates(
     head: Optional[str],
     cache_get: Callable[[str], Optional[bytes]],
     cache_set: Callable[[str, bytes], None],
-) -> Set[str]:
+) -> Tuple[Set[str], datetime.date]:
     """Cached wrapper (Artemis RedisCache): every scan in a day shares one lookup."""
-    key = f"{after.isoformat()}:{change_type.value}:{head}"
+    key = f"v2:{after.isoformat()}:{change_type.value}:{head}"
     cached = cache_get(key)
     if cached is not None:
-        return set(json.loads(cached))
-    result = fetch_changed_templates(after, change_type, head)
-    cache_set(key, json.dumps(sorted(result)).encode("utf-8"))
-    return result
+        value = json.loads(cached)
+        return set(value["templates"]), datetime.date.fromisoformat(value["covered_until"])
+    templates, covered_until = fetch_changed_templates(after, change_type, head)
+    cache_set(
+        key,
+        json.dumps({"templates": sorted(templates), "covered_until": covered_until.isoformat()}).encode("utf-8"),
+    )
+    return templates, covered_until

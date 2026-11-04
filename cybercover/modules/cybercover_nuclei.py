@@ -68,7 +68,7 @@ class CybercoverNuclei(Nuclei):
         try:
             if configuration.after is None:
                 raise TemplateLookupError("cybercover_nuclei requires a valid 'after' value")
-            self._changed = get_changed_templates(
+            self._changed, covered_until = get_changed_templates(
                 configuration.after,
                 configuration.change_type,
                 installed_templates_version(),
@@ -81,11 +81,15 @@ class CybercoverNuclei(Nuclei):
                 self.save_task_result(task=task, status=TaskStatus.ERROR, status_reason=str(exc), data=[])
             return
 
+        for task in tasks:
+            task.add_payload("covered_until", covered_until.isoformat(), persistent=True)
+
         self.log.info(
-            "%d templates changed since %s (%s), scanning %d targets",
+            "%d templates changed since %s (%s); installed templates cover through %s; scanning %d targets",
             len(self._changed),
             configuration.after,
             configuration.change_type.value,
+            covered_until,
             len(tasks),
         )
         try:

@@ -68,6 +68,8 @@ def _files(*items):
 
 def test_fetch_changed_templates_filters_by_status():
     def responses(url, params):
+        if url.endswith("/commits/v10.0.0"):
+            return {"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}
         if url.endswith("/commits"):
             assert params["until"].startswith("2026-11-03T00:00:00")
             return [{"sha": "base123"}]
@@ -84,23 +86,41 @@ def test_fetch_changed_templates_filters_by_status():
 
     session = FakeSession(responses)
     after = datetime.date(2026, 11, 3)
-    assert fetch_changed_templates(after, ChangeType.ADDED, "v10.0.0", session) == {"http/a.yaml", "http/d.yaml"}
-    assert fetch_changed_templates(after, ChangeType.ADDED_OR_MODIFIED, "v10.0.0", session) == {
-        "http/a.yaml",
-        "http/b.yaml",
-        "http/d.yaml",
-    }
+    assert fetch_changed_templates(after, ChangeType.ADDED, "v10.0.0", session) == (
+        {"http/a.yaml", "http/d.yaml"},
+        datetime.date(2026, 11, 5),
+    )
+    assert fetch_changed_templates(after, ChangeType.ADDED_OR_MODIFIED, "v10.0.0", session) == (
+        {"http/a.yaml", "http/b.yaml", "http/d.yaml"},
+        datetime.date(2026, 11, 5),
+    )
+
+
+def test_fetch_newer_after_returns_older_coverage_without_diff():
+    def responses(url, params):
+        assert url.endswith("/commits/v1")
+        return {"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}
+
+    session = FakeSession(responses)
+    assert fetch_changed_templates(
+        datetime.date(2026, 11, 6), ChangeType.ADDED_OR_MODIFIED, "v1", session
+    ) == (set(), datetime.date(2026, 11, 5))
+    assert len(session.calls) == 1
 
 
 def test_fetch_paginates_and_refuses_partial_lists():
     pages = {1: _files(*[(f"p1/{i}.yaml", "added") for i in range(100)]), 2: _files(("p2/x.yaml", "added"))}
 
     def responses(url, params):
+        if url.endswith("/commits/v1"):
+            return {"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}
         return [{"sha": "b"}] if url.endswith("/commits") else {"files": pages[params["page"]]}
 
-    assert len(fetch_changed_templates(datetime.date(2026, 11, 3), ChangeType.ADDED, "v1", FakeSession(responses))) == 101
+    assert len(fetch_changed_templates(datetime.date(2026, 11, 3), ChangeType.ADDED, "v1", FakeSession(responses))[0]) == 101
 
     def too_many(url, params):
+        if url.endswith("/commits/v1"):
+            return {"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}
         return [{"sha": "b"}] if url.endswith("/commits") else {"files": _files(*[(f"{params['page']}/{i}.yaml", "added") for i in range(100)])}
 
     with pytest.raises(TemplateLookupError):
@@ -118,10 +138,13 @@ def test_fetch_errors_are_wrapped():
 
 def test_cache_is_used_for_second_lookup():
     store = {}
-    with mock.patch("cybercover.github_templates.fetch_changed_templates", return_value={"a.yaml"}) as fetch:
+    covered_until = datetime.date(2026, 11, 5)
+    with mock.patch(
+        "cybercover.github_templates.fetch_changed_templates", return_value=({"a.yaml"}, covered_until)
+    ) as fetch:
         args = (datetime.date(2026, 11, 3), ChangeType.ADDED, "v1", store.get, lambda k, v: store.__setitem__(k, v))
-        assert get_changed_templates(*args) == {"a.yaml"}
-        assert get_changed_templates(*args) == {"a.yaml"}
+        assert get_changed_templates(*args) == ({"a.yaml"}, covered_until)
+        assert get_changed_templates(*args) == ({"a.yaml"}, covered_until)
     assert fetch.call_count == 1
 
 
@@ -181,11 +204,16 @@ def test_run_multiple_sets_changed_and_delegates():
     task = mock.Mock()
     task.payload_persistent = {"module_runtime_configurations": {"cybercover_nuclei": {"after": today_utc().isoformat()}}}
     seen = {}
-    with mock.patch("cybercover.modules.cybercover_nuclei.get_changed_templates", return_value={"a.yaml"}), mock.patch(
+    covered_until = today_utc() - DAY
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_changed_templates",
+        return_value=({"a.yaml"}, covered_until),
+    ), mock.patch(
         "artemis.modules.nuclei.Nuclei.run_multiple", lambda self, tasks: seen.update(changed=self._changed)
     ):
         module.run_multiple([task])
     assert seen["changed"] == {"a.yaml"}
+    task.add_payload.assert_called_once_with("covered_until", covered_until.isoformat(), persistent=True)
     assert module._changed is None
 
 
