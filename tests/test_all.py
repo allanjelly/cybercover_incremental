@@ -263,7 +263,7 @@ def test_scan_keeps_dast_templates_separate():
             extra_nuclei_args=["-dast"],
         )
     assert parent.call_args.args[0] == ["/tmp/dast.yaml"]
-    assert parent.call_args.kwargs["extra_nuclei_args"] == ["-dast", "-severity", "high", "-nt"]
+    assert parent.call_args.kwargs["extra_nuclei_args"] == ["-dast", "-severity", "high"]
 
 
 def test_new_release_runs_nuclei_template_updater():
@@ -508,3 +508,34 @@ def test_discovery_uses_latest_release_when_not_yet_installed(_ports_env):
     scanner = _port_scanner()
     with mock.patch("cybercover.modules.cybercover_port_scanner.latest_release", return_value="v10.6.0"):
         assert scanner._current_version() == "v10.6.0"
+
+
+def test_dast_scan_uses_release_dast_templates_as_absolute_paths_without_nt(tmp_path):
+    from artemis.modules.nuclei import ScanUsing
+
+    root = tmp_path / "nuclei-templates"
+    (root / "dast").mkdir(parents=True)
+    (root / "dast/new.yaml").write_text("id: new")
+    (root / ".new-additions").write_text("http/a.yaml\ndast/new.yaml\ndast/gone.yaml\n")
+    module = _module()
+    module._incremental = True
+    module._use_native_nt = True
+    with mock.patch("cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(root) + "/"), mock.patch(
+        "artemis.modules.nuclei.Nuclei._scan", return_value=[]
+    ) as parent:
+        module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], use_fake_home=True, extra_nuclei_args=["-dast"])
+    assert parent.call_args.args[0] == [str(root / "dast/new.yaml")]
+    assert "-nt" not in parent.call_args.kwargs["extra_nuclei_args"]
+
+
+def test_dast_scan_without_any_templates_is_skipped(tmp_path):
+    from artemis.modules.nuclei import ScanUsing
+
+    module = _module()
+    module._incremental = True
+    module._use_native_nt = True
+    with mock.patch("cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(tmp_path) + "/"), mock.patch(
+        "artemis.modules.nuclei.Nuclei._scan", return_value=[]
+    ) as parent:
+        assert module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=["-dast"]) == []
+    parent.assert_not_called()

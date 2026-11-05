@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import contextlib
 import datetime
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -111,7 +112,11 @@ class CybercoverNuclei(Nuclei):
         if self._severity_levels:
             extra_nuclei_args.extend(["-severity", ",".join(self._severity_levels)])
         use_native_nt = self._use_native_nt and not is_link_scan
-        if use_native_nt:
+        if use_native_nt and is_dast:
+            # DAST runs with a fake HOME without the templates directory, so -nt cannot resolve its
+            # list there. We read the release's .new-additions ourselves and pass absolute paths.
+            selected.extend(self._native_dast_templates())
+        elif use_native_nt:
             extra_nuclei_args.append("-nt")
             if not selected:
                 # The stock _scan skips empty template lists; nuclei ignores this config file as a template
@@ -129,6 +134,16 @@ class CybercoverNuclei(Nuclei):
             use_native_nt,
         )
         return super()._scan(selected, scan_using, targets, *args, **kwargs)
+
+    @staticmethod
+    def _native_dast_templates() -> List[str]:
+        try:
+            with open(NUCLEI_TEMPLATES_LOCATION + ".new-additions", encoding="utf-8") as f:
+                lines = [line.strip() for line in f]
+        except OSError:
+            return []
+        paths = [NUCLEI_TEMPLATES_LOCATION + line for line in lines if line.startswith("dast/")]
+        return [path for path in paths if os.path.isfile(path)]
 
     def _fail(self, tasks: List[Task], reason: str) -> None:
         self.log.error("Skipping tasks: %s", reason)
