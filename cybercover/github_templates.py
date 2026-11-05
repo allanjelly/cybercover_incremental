@@ -15,7 +15,7 @@ API = "https://api.github.com"
 RAW = f"https://raw.githubusercontent.com/{REPO}"
 TEMPLATES_CONFIG_PATH = os.path.expanduser("~/.config/nuclei/.templates-config.json")
 CACHE_TTL = 30 * 24 * 60 * 60
-RELEASE_CHECK_TTL = 6 * 60 * 60
+RELEASE_CHECK_TTL = 24 * 60 * 60
 VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 CacheGet = Callable[[str], Optional[bytes]]
@@ -147,7 +147,7 @@ def latest_release(
     cache_set: CacheSet,
     session: Optional[requests.Session] = None,
 ) -> str:
-    key = "v5:latest-release"
+    key = f"v5:latest-release:{datetime.datetime.now(datetime.timezone.utc).date().isoformat()}"
     cached = cache_get(key)
     if cached is not None:
         return cached.decode("utf-8")
