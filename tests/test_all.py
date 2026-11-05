@@ -406,3 +406,105 @@ def test_failed_nuclei_run_does_not_advance_state():
     ):
         module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
     assert _stored_version(module, "example.com:80") == "v10.5.0"
+
+
+def _port_scanner():
+    from cybercover.modules.cybercover_port_scanner import CybercoverPortScanner
+    from cybercover.state import DiscoveryStore
+
+    scanner = CybercoverPortScanner.__new__(CybercoverPortScanner)
+    scanner._store = DiscoveryStore(engine=create_engine("sqlite://"))
+    scanner._capture = None
+    scanner.cache = mock.Mock()
+    scanner.save_task_result = mock.Mock()
+    return scanner
+
+
+def _domain_task(host, client="client.pl"):
+    task = mock.Mock()
+    task.headers = {"type": "domain"}
+    task.payload_persistent = {"original_target": client}
+    task.get_payload.side_effect = {"domain": host}.get
+    return task
+
+
+@pytest.fixture
+def _ports_env():
+    from cybercover.modules.cybercover_port_scanner import CybercoverPortScanner
+
+    with mock.patch.object(CybercoverPortScanner, "log", new_callable=mock.PropertyMock), mock.patch(
+        "cybercover.modules.cybercover_port_scanner.get_target_host", side_effect=lambda t: t.get_payload("domain")
+    ), mock.patch(
+        "cybercover.modules.cybercover_port_scanner.installed_templates_version", return_value="v10.5.0"
+    ), mock.patch(
+        "cybercover.modules.cybercover_port_scanner.latest_release", return_value="v10.5.0"
+    ):
+        yield
+
+
+def test_first_scan_runs_discovery_and_stores_endpoints(_ports_env):
+    from artemis.binds import Service, TaskType
+    from karton.core import Task
+
+    scanner = _port_scanner()
+    task = _domain_task("www.client.pl")
+
+    def stock_run(tasks):
+        service = Task(
+            {"type": TaskType.SERVICE, "service": Service.HTTP}, payload={"host": "www.client.pl", "port": 443, "ssl": True}
+        )
+        scanner.add_task(tasks[0], service)
+
+    with mock.patch("artemis.module_base.ArtemisBase.add_task"), mock.patch(
+        "artemis.modules.port_scanner.PortScanner.run_multiple", side_effect=stock_run
+    ) as stock:
+        scanner.run_multiple([task])
+    assert stock.call_count == 1
+    assert scanner._store.get_version("client.pl", "www.client.pl") == "v10.5.0"
+    assert scanner._store.get_endpoints("client.pl", "www.client.pl") == [(443, "http", True)]
+    assert scanner._capture is None
+
+
+def test_known_host_without_new_release_replays_endpoints_without_scanning(_ports_env):
+    scanner = _port_scanner()
+    scanner._store.replace("client.pl", "www.client.pl", "v10.5.0", [(443, "http", True), (8080, "http", False)])
+    task = _domain_task("www.client.pl")
+    with mock.patch("artemis.module_base.ArtemisBase.add_task") as add, mock.patch(
+        "artemis.modules.port_scanner.PortScanner.run_multiple"
+    ) as stock:
+        scanner.run_multiple([task])
+    stock.assert_not_called()
+    assert add.call_count == 2
+    created = [call.args[1] for call in add.call_args_list]
+    assert [t.get_payload("port") for t in created] == [443, 8080]
+    assert [t.get_payload("ssl") for t in created] == [True, False]
+    assert scanner.save_task_result.call_args.kwargs["data"] == {
+        "www.client.pl": {"443": {"service": "http", "ssl": True}, "8080": {"service": "http", "ssl": False}}
+    }
+
+
+def test_new_release_triggers_rediscovery_and_replaces_endpoints(_ports_env):
+    scanner = _port_scanner()
+    scanner._store.replace("client.pl", "www.client.pl", "v10.4.0", [(8080, "http", False)])
+    task = _domain_task("www.client.pl")
+    with mock.patch("artemis.modules.port_scanner.PortScanner.run_multiple") as stock:
+        scanner.run_multiple([task])
+    stock.assert_called_once_with([task])
+    assert scanner._store.get_version("client.pl", "www.client.pl") == "v10.5.0"
+    assert scanner._store.get_endpoints("client.pl", "www.client.pl") == []
+
+
+def test_failed_discovery_does_not_store_state(_ports_env):
+    scanner = _port_scanner()
+    task = _domain_task("www.client.pl")
+    with mock.patch("artemis.modules.port_scanner.PortScanner.run_multiple", side_effect=RuntimeError("naabu")):
+        with pytest.raises(RuntimeError):
+            scanner.run_multiple([task])
+    assert scanner._store.get_version("client.pl", "www.client.pl") is None
+    assert scanner._capture is None
+
+
+def test_discovery_uses_latest_release_when_not_yet_installed(_ports_env):
+    scanner = _port_scanner()
+    with mock.patch("cybercover.modules.cybercover_port_scanner.latest_release", return_value="v10.6.0"):
+        assert scanner._current_version() == "v10.6.0"

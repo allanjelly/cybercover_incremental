@@ -7,13 +7,29 @@ does not pass dates or versions:
 ```json
 {
   "targets": ["example.com"],
-  "enabled_modules": ["port_scanner", "nuclei-router", "cybercover_nuclei"]
+  "enabled_modules": ["cybercover_port_scanner", "nuclei-router", "cybercover_nuclei"]
 }
 ```
 
-`port_scanner` and `nuclei-router` are required for domain/IP targets because Artemis does not
-enable dependencies automatically. Do **not** also enable `nuclei-module`; that would run a
-second Nuclei scan.
+`cybercover_port_scanner` and `nuclei-router` are required for domain/IP targets because Artemis
+does not enable dependencies automatically. Do **not** also enable `port_scanner` or
+`nuclei-module`; that would run duplicate port and Nuclei scans.
+
+## Port discovery only when needed
+
+`cybercover_port_scanner` subclasses the stock `PortScanner` and consumes the same DOMAIN/IP tasks.
+For every (client, host) - the client is `original_target`, the host is the DOMAIN/IP of the task:
+
+- no stored endpoints, or they were discovered before the newest nuclei-templates release (the
+  newer of the installed and the latest GitHub release): the stock scanner runs (naabu +
+  fingerprintx). The resulting SERVICE endpoints (`host`, `port`, `service`, `ssl`) replace the
+  stored list in `cybercover_endpoints` and the release is stored in `cybercover_discovery_state`.
+  If the scan fails nothing is stored, so discovery repeats.
+- stored endpoints from the current release: no network scan. The stored endpoints are emitted as
+  the same SERVICE tasks, so `nuclei-router` and `cybercover_nuclei` run as usual.
+
+Ports opened between releases are therefore discovered only after the next release. A DNS lookup
+is not repeated on replay. If the state cannot be read, full discovery runs.
 
 ## Daily incremental workflow
 
@@ -44,11 +60,12 @@ State is currently per endpoint (`host:port`), not per business-level customer r
 
 ## Deployment
 
-1. Apply `artemis-docker-compose.patch` (adds the `karton-cybercover-nuclei` service) and place
+1. Apply `artemis-docker-compose.patch` (adds the `karton-cybercover-nuclei` and
+   `karton-cybercover-port-scanner` services) and place
    this package's `cybercover/` directory next to the compose file (or set `CYBERCOVER_DIR`).
 2. Keep the module out of full scans by adding `cybercover_nuclei` to `MODULES_DISABLED_BY_DEFAULT`
-   in `.env`. This variable replaces Artemis' default list, so repeat it:
-   `MODULES_DISABLED_BY_DEFAULT=admin_panel_login_bruter,dangling_dns_detector,example,humble,leak_scanner,ssh_bruter,xss_scanner,cybercover_nuclei`
+   in `.env` (also `cybercover_port_scanner`). This variable replaces Artemis' default list, so repeat it:
+   `MODULES_DISABLED_BY_DEFAULT=admin_panel_login_bruter,dangling_dns_detector,example,humble,leak_scanner,ssh_bruter,xss_scanner,cybercover_nuclei,cybercover_port_scanner`
 3. Restart `karton-cybercover-nuclei` daily before the scan window. Artemis refreshes its in-memory
    template lists when the worker starts.
 4. Optional: `CYBERCOVER_GITHUB_TOKEN` (a read-only token) raises GitHub API rate limits.

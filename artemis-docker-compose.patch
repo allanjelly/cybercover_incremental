@@ -1,12 +1,27 @@
---- docker-compose.yaml.orig
-+++ docker-compose.yaml
-@@ -306,6 +306,21 @@
+--- docker-compose.yaml.orig	2026-11-05 13:58:35.448863344 +0000
++++ docker-compose.yaml	2026-11-05 13:58:35.448863344 +0000
+@@ -306,6 +306,36 @@
        - data-nuclei-templates:/root/nuclei-templates
        - data-nuclei-config:/root/.config/nuclei
  
 +  karton-cybercover-nuclei:
 +    <<: [*logging, *artemis-build-or-image]
 +    command: "python3 -m cybercover.modules.cybercover_nuclei"
++    labels:
++      prometheus.port: "9001"
++    env_file: .env
++    environment:
++      PYTHONPATH: /opt
++    restart: always
++    volumes:
++      - ${CYBERCOVER_DIR:-./cybercover}:/opt/cybercover:ro
++      - "${DOCKER_COMPOSE_ADDITIONAL_SHARED_DIRECTORY:-./shared}:/shared/"
++      - data-nuclei-templates:/root/nuclei-templates
++      - data-nuclei-config:/root/.config/nuclei
++
++  karton-cybercover-port-scanner:
++    <<: [*logging, *artemis-build-or-image]
++    command: "python3 -m cybercover.modules.cybercover_port_scanner"
 +    labels:
 +      prometheus.port: "9001"
 +    env_file: .env
