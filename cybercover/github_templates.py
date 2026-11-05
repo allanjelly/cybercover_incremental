@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import logging
 import os
 import re
 from pathlib import PurePosixPath
@@ -18,12 +19,18 @@ CACHE_TTL = 30 * 24 * 60 * 60
 RELEASE_CHECK_TTL = 24 * 60 * 60
 VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
+log = logging.getLogger(__name__)
+
 CacheGet = Callable[[str], Optional[bytes]]
 CacheSet = Callable[..., None]
 
 
 class TemplateLookupError(Exception):
     pass
+
+
+class TemplateNotFoundError(TemplateLookupError):
+    """The file does not exist on GitHub (e.g. a template listed in .new-additions was removed)."""
 
 
 def parse_version(value: object) -> Tuple[int, int, int]:
@@ -55,8 +62,12 @@ def _request(
         headers["Authorization"] = f"Bearer {token}"
     try:
         response = session.get(url, params=params, headers=headers, timeout=30)
+        if response.status_code == 404:
+            raise TemplateNotFoundError(f"GitHub returned 404: {url}")
         response.raise_for_status()
         return response.content if raw else response.json()
+    except TemplateNotFoundError:
+        raise
     except (requests.RequestException, ValueError) as exc:
         raise TemplateLookupError(f"GitHub request failed: {url}: {exc}") from exc
 
@@ -93,7 +104,7 @@ def get_daily_additions(
     session: Optional[requests.Session] = None,
 ) -> Set[str]:
     """Return one stable snapshot of main/.new-additions per UTC date and installed release."""
-    key = f"v5:additions:{day.isoformat()}:{version}"
+    key = f"cybercover:additions:{day.isoformat()}:{version}"
     cached = cache_get(key)
     if cached is not None:
         return set(json.loads(cached))
@@ -108,20 +119,20 @@ def get_daily_additions(
 
 
 def get_cached_additions(day: datetime.date, version: str, cache_get: CacheGet) -> Optional[Set[str]]:
-    cached = cache_get(f"v5:additions:{day.isoformat()}:{version}")
+    cached = cache_get(f"cybercover:additions:{day.isoformat()}:{version}")
     return set(json.loads(cached)) if cached is not None else None
 
 
 def templates_to_scan(
     last_version: Optional[str],
-    last_scanned_at: Optional[datetime.datetime | datetime.date],
+    last_scan_date: Optional[datetime.date],
     installed_version: str,
     today: datetime.date,
     today_additions: Set[str],
     cache_get: CacheGet,
 ) -> Tuple[Set[str], bool]:
     """Return changed paths and whether to run Nuclei's native -nt for this scan."""
-    if last_version is None or last_scanned_at is None:
+    if last_version is None or last_scan_date is None:
         return set(today_additions), True
 
     try:
@@ -132,10 +143,9 @@ def templates_to_scan(
         # -nt covers the intervening release; today's main snapshot covers changes made after it.
         return set(today_additions), True
 
-    previous_day = last_scanned_at.date() if isinstance(last_scanned_at, datetime.datetime) else last_scanned_at
-    if previous_day >= today:
+    if last_scan_date >= today:
         return set(), False
-    previous_additions = get_cached_additions(previous_day, last_version, cache_get)
+    previous_additions = get_cached_additions(last_scan_date, last_version, cache_get)
     if previous_additions is None:
         # If Redis lost an older daily snapshot, rescan today's list rather than risk a gap.
         return set(today_additions), False
@@ -147,7 +157,7 @@ def latest_release(
     cache_set: CacheSet,
     session: Optional[requests.Session] = None,
 ) -> str:
-    key = f"v5:latest-release:{datetime.datetime.now(datetime.timezone.utc).date().isoformat()}"
+    key = f"cybercover:latest-release:{datetime.datetime.now(datetime.timezone.utc).date().isoformat()}"
     cached = cache_get(key)
     if cached is not None:
         return cached.decode("utf-8")
@@ -173,19 +183,23 @@ def get_template_contents(
     cache_set: CacheSet,
     session: Optional[requests.Session] = None,
 ) -> dict[str, bytes]:
-    """Fetch template YAMLs from main; cache each day's content for reuse across clients."""
+    """Fetch template YAMLs from main (missing files are skipped); cache each day's content for reuse across clients."""
     session = session or requests.Session()
     contents: dict[str, bytes] = {}
     for path in sorted(paths):
         path = _validate_template_path(path)
-        key = f"v5:template:{day.isoformat()}:{version}:{path}"
+        key = f"cybercover:template:{day.isoformat()}:{version}:{path}"
         cached = cache_get(key)
         if cached is not None:
             contents[path] = cached
             continue
 
         encoded_path = quote(path, safe="/")
-        content = _request(session, f"{RAW}/main/{encoded_path}", raw=True)
+        try:
+            content = _request(session, f"{RAW}/main/{encoded_path}", raw=True)
+        except TemplateNotFoundError:
+            log.warning("Skipping template listed in .new-additions but missing on main: %s", path)
+            continue
         if not isinstance(content, bytes) or not content:
             raise TemplateLookupError(f"Empty or invalid template response for {path}")
         _cache_set(cache_set, key, content)

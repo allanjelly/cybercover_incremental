@@ -38,9 +38,6 @@ class ScanStateStore:
             rows = session.query(ScanState).filter(ScanState.target.in_(targets)).all()
             return {row.target: (row.templates_version, row.scanned_at) for row in rows}
 
-    def get_versions(self, targets: Iterable[str]) -> Dict[str, str]:
-        return {target: version for target, (version, _) in self.get_states(targets).items()}
-
     def set_versions(self, targets: Iterable[str], version: str) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
         with self._session() as session:

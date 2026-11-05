@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+import contextlib
 import datetime
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set
 
 from karton.core import Task
 from prometheus_client import start_http_server
@@ -11,8 +12,9 @@ from sqlalchemy.exc import SQLAlchemyError  # type: ignore
 
 from artemis import load_risk_class
 from artemis.binds import TaskStatus
-from artemis.modules.nuclei import Nuclei, ScanUsing
-from artemis.utils import directory_backup
+from artemis.modules import nuclei as nuclei_module
+from artemis.modules.nuclei import NUCLEI_TEMPLATES_LOCATION, Nuclei, ScanUsing
+from artemis.utils import CalledProcessErrorWithMessage, directory_backup
 
 from cybercover.github_templates import (
     TemplateLookupError,
@@ -50,7 +52,9 @@ class CybercoverNuclei(Nuclei):
     _custom_template_paths: Dict[str, str] = {}
     _severity_levels: List[str] = []
     _incremental = False
-    _include_native_new_templates = False
+    _use_native_nt = False
+    _scanned_categories: Set[bool] = set()
+    _nuclei_failures = 0
     _state: Optional[ScanStateStore] = None
 
     @property
@@ -58,6 +62,24 @@ class CybercoverNuclei(Nuclei):
         if self._state is None:
             self._state = ScanStateStore()
         return self._state
+
+    @contextlib.contextmanager
+    def _count_nuclei_failures(self) -> Iterator[None]:
+        # The stock _scan logs and swallows failed Nuclei runs, so we observe them one level below.
+        original = nuclei_module.check_output_log_on_error_with_stderr
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return original(*args, **kwargs)
+            except CalledProcessErrorWithMessage:
+                self._nuclei_failures += 1
+                raise
+
+        nuclei_module.check_output_log_on_error_with_stderr = wrapper
+        try:
+            yield
+        finally:
+            nuclei_module.check_output_log_on_error_with_stderr = original
 
     def _scan(  # type: ignore[override]
         self,
@@ -71,31 +93,40 @@ class CybercoverNuclei(Nuclei):
             return super()._scan(templates_or_workflows, scan_using, targets, *args, **kwargs)
         if scan_using == ScanUsing.WORKFLOWS:
             return []
-        extra_nuclei_args = kwargs.get("extra_nuclei_args", [])
+        extra_nuclei_args = list(kwargs.get("extra_nuclei_args", []))
         is_dast = "-dast" in extra_nuclei_args
-        category = "dast" if is_dast else "templates"
+
+        # The stock run_multiple scans the whole template list once per category and then repeats
+        # scans on homepage links with a short template list. Link scans may only use the changed
+        # templates that are also on that list and never the native -nt selection.
+        is_link_scan = is_dast in self._scanned_categories
+        self._scanned_categories.add(is_dast)
 
         selected = [
             local_path
             for path, local_path in self._custom_template_paths.items()
             if path.startswith("dast/") == is_dast
+            and (not is_link_scan or NUCLEI_TEMPLATES_LOCATION + path in templates_or_workflows)
         ]
-        extra_nuclei_args = list(extra_nuclei_args)
         if self._severity_levels:
             extra_nuclei_args.extend(["-severity", ",".join(self._severity_levels)])
-        if self._include_native_new_templates:
+        use_native_nt = self._use_native_nt and not is_link_scan
+        if use_native_nt:
             extra_nuclei_args.append("-nt")
             if not selected:
                 # The stock _scan skips empty template lists; nuclei ignores this config file as a template
                 # and adds the installed release's new templates because of -nt.
                 selected.append(NEW_ADDITIONS_PLACEHOLDER)
+        if not selected:
+            return []
         kwargs["extra_nuclei_args"] = extra_nuclei_args
 
         self.log.info(
-            "Incremental %s scan: %d custom templates, native -nt=%s",
-            category,
-            len([path for path in self._custom_template_paths if path.startswith("dast/") == is_dast]),
-            self._include_native_new_templates,
+            "Incremental %s %s scan: %d custom templates, native -nt=%s",
+            "dast" if is_dast else "templates",
+            "link" if is_link_scan else "main",
+            len(selected),
+            use_native_nt,
         )
         return super()._scan(selected, scan_using, targets, *args, **kwargs)
 
@@ -134,12 +165,12 @@ class CybercoverNuclei(Nuclei):
             return
 
         try:
-            head = installed_templates_version()
-            if not head:
+            installed_version = installed_templates_version()
+            if not installed_version:
                 raise TemplateLookupError("Unable to determine the installed nuclei-templates release")
-            head = self._update_templates_if_needed(head)
+            installed_version = self._update_templates_if_needed(installed_version)
             today = datetime.datetime.now(datetime.timezone.utc).date()
-            additions = get_daily_additions(today, head, self.cache.get, self.cache.set)
+            additions = get_daily_additions(today, installed_version, self.cache.get, self.cache.set)
             stored = self.state.get_states(target_key(task) for task in tasks)
         except (TemplateLookupError, SQLAlchemyError, OSError, subprocess.CalledProcessError, ValueError) as exc:
             self._fail(tasks, f"Unable to prepare incremental scan: {exc}")
@@ -151,43 +182,44 @@ class CybercoverNuclei(Nuclei):
             group_key = (state[0], state[1].date()) if state else (None, None)
             groups.setdefault(group_key, []).append(task)
 
-        for (version, scanned_day), group in groups.items():
-            self._run_group(group, version, scanned_day, head, today, additions)
+        for (last_version, last_scan_date), group in groups.items():
+            self._run_group(group, last_version, last_scan_date, installed_version, today, additions)
 
     def _run_group(
         self,
         tasks: List[Task],
-        after_version: Optional[str],
-        last_scanned_at: Optional[datetime.date],
-        head: str,
+        last_version: Optional[str],
+        last_scan_date: Optional[datetime.date],
+        installed_version: str,
         today: datetime.date,
         additions: Set[str],
     ) -> None:
         try:
             changed, use_native_nt = templates_to_scan(
-                after_version, last_scanned_at, head, today, additions, self.cache.get
+                last_version, last_scan_date, installed_version, today, additions, self.cache.get
             )
-            contents = get_template_contents(changed, today, head, self.cache.get, self.cache.set)
+            contents = get_template_contents(changed, today, installed_version, self.cache.get, self.cache.set)
         except (TemplateLookupError, OSError, subprocess.CalledProcessError, ValueError) as exc:
             self._fail(tasks, str(exc))
             return
 
         for task in tasks:
-            task.add_payload("templates_after_version", after_version, persistent=True)
-            task.add_payload("templates_version", head, persistent=True)
+            task.add_payload("templates_after_version", last_version, persistent=True)
+            task.add_payload("templates_version", installed_version, persistent=True)
 
         self.log.info(
-            "%d targets: %d changed templates since %s (installed %s; native -nt=%s)",
+            "%d targets: %d changed templates (%d downloaded) since %s (installed %s; native -nt=%s)",
             len(tasks),
             len(changed),
-            last_scanned_at,
-            head,
+            len(contents),
+            last_scan_date,
+            installed_version,
             use_native_nt,
         )
-        if not changed and not use_native_nt:
+        if not contents and not use_native_nt:
             for task in tasks:
                 self.save_task_result(task=task, status=TaskStatus.OK, status_reason="No new templates", data=[])
-            self.state.set_versions((target_key(task) for task in tasks), head)
+            self.state.set_versions((target_key(task) for task in tasks), installed_version)
         else:
             with tempfile.TemporaryDirectory(prefix="cybercover-nuclei-") as directory:
                 custom_paths: Dict[str, str] = {}
@@ -200,15 +232,26 @@ class CybercoverNuclei(Nuclei):
                 self._custom_template_paths = custom_paths
                 self._severity_levels = self.get_runtime_configuration(tasks[0]).get_severity_options()
                 self._incremental = True
-                self._include_native_new_templates = use_native_nt
+                self._use_native_nt = use_native_nt
+                self._scanned_categories = set()
+                self._nuclei_failures = 0
                 try:
-                    super().run_multiple(tasks)
-                    self.state.set_versions((target_key(task) for task in tasks), head)
+                    with self._count_nuclei_failures():
+                        super().run_multiple(tasks)
+                    if self._nuclei_failures:
+                        self.log.error(
+                            "%d Nuclei runs failed; not advancing scan state for %d targets",
+                            self._nuclei_failures,
+                            len(tasks),
+                        )
+                    else:
+                        self.state.set_versions((target_key(task) for task in tasks), installed_version)
                 finally:
                     self._custom_template_paths = {}
                     self._severity_levels = []
                     self._incremental = False
-                    self._include_native_new_templates = False
+                    self._use_native_nt = False
+                    self._scanned_categories = set()
 
 
 if __name__ == "__main__":

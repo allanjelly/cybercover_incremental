@@ -19,13 +19,15 @@ from cybercover.state import ScanStateStore
 
 
 class FakeSession:
-    def __init__(self, response):
+    def __init__(self, response, status_code=200):
         self.response = response
+        self.status_code = status_code
         self.calls = []
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.calls.append(url)
         response = mock.Mock()
+        response.status_code = self.status_code
         response.raise_for_status.return_value = None
         response.json.return_value = self.response
         response.content = self.response if isinstance(self.response, bytes) else b""
@@ -86,7 +88,7 @@ def test_template_selection_for_first_scan_and_release_transition():
     assert templates_to_scan(None, None, "v10.5.1", today, additions, lambda _: None) == (additions, True)
     assert templates_to_scan(
         "v10.5.0",
-        datetime.datetime(2026, 11, 4, tzinfo=datetime.timezone.utc),
+        datetime.date(2026, 11, 4),
         "v10.5.1",
         today,
         additions,
@@ -99,7 +101,7 @@ def test_template_selection_diffs_daily_snapshots():
     yesterday = datetime.date(2026, 11, 4)
     additions = {"http/a.yaml", "http/b.yaml"}
     old = {"http/a.yaml"}
-    cache = {f"v5:additions:{yesterday.isoformat()}:v10.5.1": b'["http/a.yaml"]'}
+    cache = {f"cybercover:additions:{yesterday.isoformat()}:v10.5.1": b'["http/a.yaml"]'}
     assert templates_to_scan(
         "v10.5.1",
         yesterday,
@@ -190,9 +192,15 @@ def _module():
     module.save_task_result = mock.Mock()
     module.lock = mock.MagicMock()
     module._incremental = False
+    module._scanned_categories = set()
+    module._nuclei_failures = 0
     module._custom_template_paths = {}
-    module._include_native_new_templates = False
+    module._use_native_nt = False
     return module
+
+
+def _stored_version(module, target):
+    return module.state.get_states([target])[target][0]
 
 
 def _task(host, port=80):
@@ -217,7 +225,7 @@ def test_scan_supplies_cached_custom_and_native_nt_templates(tmp_path):
     custom.write_text("id: custom")
     module._incremental = True
     module._custom_template_paths = {"http/custom.yaml": str(custom)}
-    module._include_native_new_templates = True
+    module._use_native_nt = True
     module._severity_levels = ["high", "critical"]
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan(
@@ -245,7 +253,7 @@ def test_scan_keeps_dast_templates_separate():
         "http/custom.yaml": "/tmp/custom.yaml",
         "dast/custom.yaml": "/tmp/dast.yaml",
     }
-    module._include_native_new_templates = True
+    module._use_native_nt = True
     module._severity_levels = ["high"]
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan(
@@ -281,7 +289,7 @@ def test_native_nt_without_custom_templates_uses_placeholder():
 
     module = _module()
     module._incremental = True
-    module._include_native_new_templates = True
+    module._use_native_nt = True
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=[])
     assert parent.call_args.args[0] == [NEW_ADDITIONS_PLACEHOLDER]
@@ -301,7 +309,7 @@ def test_no_changes_saves_success_and_advances_state():
     ):
         module._run_group([task], "v10.5.1", day, "v10.5.1", day, set())
     assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.OK
-    assert module.state.get_versions(["example.com:80"]) == {"example.com:80": "v10.5.1"}
+    assert _stored_version(module, "example.com:80") == "v10.5.1"
 
 
 def test_run_group_keeps_state_if_template_lookup_fails():
@@ -317,7 +325,7 @@ def test_run_group_keeps_state_if_template_lookup_fails():
     ):
         module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
     assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.ERROR
-    assert module.state.get_versions(["example.com:80"]) == {"example.com:80": "v10.5.0"}
+    assert _stored_version(module, "example.com:80") == "v10.5.0"
 
 
 def test_run_group_scans_cached_yaml_then_saves_version(tmp_path):
@@ -341,4 +349,60 @@ def test_run_group_scans_cached_yaml_then_saves_version(tmp_path):
 
         module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
     assert scan.call_count == 1
-    assert module.state.get_versions(["example.com:80"]) == {"example.com:80": "v10.5.1"}
+    assert _stored_version(module, "example.com:80") == "v10.5.1"
+
+
+def test_missing_template_on_main_is_skipped():
+    session = FakeSession(b"", status_code=404)
+    contents = get_template_contents(
+        {"http/removed.yaml"}, datetime.date(2026, 11, 5), "v10.5.1", lambda _: None, lambda *a, **k: None, session
+    )
+    assert contents == {}
+
+
+def test_link_scan_uses_only_changed_templates_from_the_homepage_list_without_nt():
+    from artemis.modules.nuclei import NUCLEI_TEMPLATES_LOCATION, ScanUsing
+
+    module = _module()
+    module._incremental = True
+    module._use_native_nt = True
+    module._custom_template_paths = {"http/a.yaml": "/tmp/a.yaml", "http/b.yaml": "/tmp/b.yaml"}
+    with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
+        module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=[])
+        module._scan(
+            [NUCLEI_TEMPLATES_LOCATION + "http/b.yaml"], ScanUsing.TEMPLATES, ["https://example.com/x"], extra_nuclei_args=[]
+        )
+        module._scan([NUCLEI_TEMPLATES_LOCATION + "http/other.yaml"], ScanUsing.TEMPLATES, ["https://example.com/y"])
+    assert parent.call_count == 2
+    assert sorted(parent.call_args_list[0].args[0]) == ["/tmp/a.yaml", "/tmp/b.yaml"]
+    assert "-nt" in parent.call_args_list[0].kwargs["extra_nuclei_args"]
+    assert parent.call_args_list[1].args[0] == ["/tmp/b.yaml"]
+    assert "-nt" not in parent.call_args_list[1].kwargs["extra_nuclei_args"]
+
+
+def test_failed_nuclei_run_does_not_advance_state():
+    from artemis.utils import CalledProcessErrorWithMessage
+
+    module = _module()
+    task = _task("example.com")
+    module.state.set_versions(["example.com:80"], "v10.5.0")
+    day = datetime.date(2026, 11, 5)
+
+    def failing_run(tasks):
+        import artemis.modules.nuclei as nuclei_module
+
+        try:
+            nuclei_module.check_output_log_on_error_with_stderr(["nuclei"], mock.Mock())
+        except CalledProcessErrorWithMessage:
+            pass
+
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=({"http/a.yaml"}, False)
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_template_contents", return_value={"http/a.yaml": b"id: a\n"}
+    ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple", side_effect=failing_run), mock.patch(
+        "artemis.modules.nuclei.check_output_log_on_error_with_stderr",
+        side_effect=CalledProcessErrorWithMessage("boom", 1, ["nuclei"], b"", b"boom"),
+    ):
+        module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
+    assert _stored_version(module, "example.com:80") == "v10.5.0"
