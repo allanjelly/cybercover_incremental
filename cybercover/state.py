@@ -1,7 +1,7 @@
 """Per-target scan state: the nuclei-templates version a target was last scanned with."""
 
 import datetime
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 from sqlalchemy import Column, DateTime, MetaData, String, create_engine  # type: ignore
 from sqlalchemy.engine import Engine  # type: ignore
@@ -30,11 +30,16 @@ class ScanStateStore:
         self._session = sessionmaker(bind=engine)
         Base.metadata.create_all(engine)
 
-    def get_versions(self, targets: Iterable[str]) -> Dict[str, str]:
+    def get_states(self, targets: Iterable[str]) -> Dict[str, Tuple[str, datetime.datetime]]:
         targets = list(set(targets))
+        if not targets:
+            return {}
         with self._session() as session:
             rows = session.query(ScanState).filter(ScanState.target.in_(targets)).all()
-            return {row.target: row.templates_version for row in rows}
+            return {row.target: (row.templates_version, row.scanned_at) for row in rows}
+
+    def get_versions(self, targets: Iterable[str]) -> Dict[str, str]:
+        return {target: version for target, (version, _) in self.get_states(targets).items()}
 
     def set_versions(self, targets: Iterable[str], version: str) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)

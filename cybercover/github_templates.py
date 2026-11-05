@@ -1,26 +1,29 @@
-"""Finds nuclei-templates files changed between two release tags, using the GitHub API."""
+"""Fetch and cache daily additions from the nuclei-templates repository."""
 
+import datetime
 import json
 import os
 import re
+from pathlib import PurePosixPath
 from typing import Callable, Optional, Set, Tuple
+from urllib.parse import quote
 
 import requests
 
 REPO = os.environ.get("CYBERCOVER_TEMPLATES_REPO", "projectdiscovery/nuclei-templates")
 API = "https://api.github.com"
+RAW = f"https://raw.githubusercontent.com/{REPO}"
 TEMPLATES_CONFIG_PATH = os.path.expanduser("~/.config/nuclei/.templates-config.json")
-COMPARE_FILES_LIMIT = 300  # GitHub returns at most this many files from /compare
+CACHE_TTL = 30 * 24 * 60 * 60
+RELEASE_CHECK_TTL = 6 * 60 * 60
 VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
-CHANGED_STATUSES = {"added", "renamed", "modified", "changed", "copied"}
+
+CacheGet = Callable[[str], Optional[bytes]]
+CacheSet = Callable[..., None]
 
 
 class TemplateLookupError(Exception):
     pass
-
-
-class TooManyChangesError(TemplateLookupError):
-    """The gap is too big for the compare API: the caller should fall back to a full scan."""
 
 
 def parse_version(value: object) -> Tuple[int, int, int]:
@@ -39,91 +42,152 @@ def installed_templates_version(path: str = TEMPLATES_CONFIG_PATH) -> Optional[s
         return None
 
 
-def _get(session: requests.Session, url: str, **params: object) -> object:
+def _request(
+    session: requests.Session,
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    raw: bool = False,
+) -> object:
     headers = {"Accept": "application/vnd.github+json"}
     token = os.environ.get("CYBERCOVER_GITHUB_TOKEN")
-    if token:
+    if token and url.startswith(API):
         headers["Authorization"] = f"Bearer {token}"
     try:
         response = session.get(url, params=params, headers=headers, timeout=30)
         response.raise_for_status()
-        return response.json()
+        return response.content if raw else response.json()
     except (requests.RequestException, ValueError) as exc:
         raise TemplateLookupError(f"GitHub request failed: {url}: {exc}") from exc
 
 
-def previous_release(head: str, session: Optional[requests.Session] = None) -> str:
-    """The newest nuclei-templates release older than ``head``."""
-    session = session or requests.Session()
-    head_version = parse_version(head)
-    releases = _get(session, f"{API}/repos/{REPO}/releases", per_page=100)
-    if not isinstance(releases, list):
-        raise TemplateLookupError("Unexpected GitHub releases response")
-    older = [
-        item["tag_name"]
-        for item in releases
-        if isinstance(item, dict)
-        and VERSION_RE.match(str(item.get("tag_name")))
-        and parse_version(item["tag_name"]) < head_version
-    ]
-    if not older:
-        raise TemplateLookupError(f"No release older than {head} found")
-    return max(older, key=parse_version)
+def _cache_set(cache_set: CacheSet, key: str, value: bytes, ttl: int = CACHE_TTL) -> None:
+    cache_set(key, value, timeout=ttl)
 
 
-def fetch_changed_templates(
-    after_version: str,
-    head: str,
+def _validate_template_path(path: str) -> str:
+    parsed = PurePosixPath(path)
+    if (
+        parsed.is_absolute()
+        or not parsed.parts
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+        or parsed.suffix not in {".yaml", ".yml"}
+    ):
+        raise TemplateLookupError(f"Invalid template path in .new-additions: {path!r}")
+    return parsed.as_posix()
+
+
+def _parse_additions(data: bytes) -> Set[str]:
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise TemplateLookupError("Invalid UTF-8 in nuclei-templates .new-additions") from exc
+    return {_validate_template_path(line.strip()) for line in lines if line.strip()}
+
+
+def get_daily_additions(
+    day: datetime.date,
+    version: str,
+    cache_get: CacheGet,
+    cache_set: CacheSet,
     session: Optional[requests.Session] = None,
 ) -> Set[str]:
-    """Paths of templates added or modified between ``after_version`` and ``head``."""
-    session = session or requests.Session()
-    data = _get(session, f"{API}/repos/{REPO}/compare/{after_version}...{head}", per_page=100, page=1)
-    if not isinstance(data, dict):
-        raise TemplateLookupError("Unexpected GitHub compare response")
-    files = data.get("files", [])
-    # /compare returns at most 300 files in total (later pages are empty), so a full list may be truncated
-    if len(files) >= COMPARE_FILES_LIMIT:
-        raise TooManyChangesError(f"Too many changed files between {after_version} and {head}")
-    return {
-        item["filename"]
-        for item in files
-        if item.get("status") in CHANGED_STATUSES and item["filename"].endswith((".yaml", ".yml"))
-    }
-
-
-def get_changed_templates(
-    after_version: str,
-    head: str,
-    cache_get: Callable[[str], Optional[bytes]],
-    cache_set: Callable[[str, bytes], None],
-) -> Set[str]:
-    """Cached wrapper (Artemis RedisCache): scans with the same versions share one lookup."""
-    key = f"v4:{after_version}:{head}"
+    """Return one stable snapshot of main/.new-additions per UTC date and installed release."""
+    key = f"v5:additions:{day.isoformat()}:{version}"
     cached = cache_get(key)
     if cached is not None:
-        value = json.loads(cached)
-        if value.get("too_many"):
-            raise TooManyChangesError(f"Too many changed files between {after_version} and {head}")
-        return set(value["templates"])
+        return set(json.loads(cached))
+
+    session = session or requests.Session()
+    content = _request(session, f"{RAW}/main/.new-additions", raw=True)
+    if not isinstance(content, bytes):
+        raise TemplateLookupError("Unexpected response for nuclei-templates .new-additions")
+    additions = _parse_additions(content)
+    _cache_set(cache_set, key, json.dumps(sorted(additions)).encode("utf-8"))
+    return additions
+
+
+def get_cached_additions(day: datetime.date, version: str, cache_get: CacheGet) -> Optional[Set[str]]:
+    cached = cache_get(f"v5:additions:{day.isoformat()}:{version}")
+    return set(json.loads(cached)) if cached is not None else None
+
+
+def templates_to_scan(
+    last_version: Optional[str],
+    last_scanned_at: Optional[datetime.datetime | datetime.date],
+    installed_version: str,
+    today: datetime.date,
+    today_additions: Set[str],
+    cache_get: CacheGet,
+) -> Tuple[Set[str], bool]:
+    """Return changed paths and whether to run Nuclei's native -nt for this scan."""
+    if last_version is None or last_scanned_at is None:
+        return set(today_additions), True
+
     try:
-        templates = fetch_changed_templates(after_version, head)
-    except TooManyChangesError:
-        cache_set(key, json.dumps({"too_many": True}).encode("utf-8"))
-        raise
-    cache_set(key, json.dumps({"templates": sorted(templates)}).encode("utf-8"))
-    return templates
+        release_changed = parse_version(last_version) < parse_version(installed_version)
+    except ValueError as exc:
+        raise TemplateLookupError(str(exc)) from exc
+    if release_changed:
+        # -nt covers the intervening release; today's main snapshot covers changes made after it.
+        return set(today_additions), True
+
+    previous_day = last_scanned_at.date() if isinstance(last_scanned_at, datetime.datetime) else last_scanned_at
+    if previous_day >= today:
+        return set(), False
+    previous_additions = get_cached_additions(previous_day, last_version, cache_get)
+    if previous_additions is None:
+        # If Redis lost an older daily snapshot, rescan today's list rather than risk a gap.
+        return set(today_additions), False
+    return set(today_additions) - previous_additions, False
 
 
-def get_previous_release(
-    head: str,
-    cache_get: Callable[[str], Optional[bytes]],
-    cache_set: Callable[[str, bytes], None],
+def latest_release(
+    cache_get: CacheGet,
+    cache_set: CacheSet,
+    session: Optional[requests.Session] = None,
 ) -> str:
-    key = f"v4:previous:{head}"
+    key = "v5:latest-release"
     cached = cache_get(key)
     if cached is not None:
         return cached.decode("utf-8")
-    result = previous_release(head)
-    cache_set(key, result.encode("utf-8"))
-    return result
+
+    session = session or requests.Session()
+    data = _request(session, f"{API}/repos/{REPO}/releases/latest")
+    if not isinstance(data, dict) or not isinstance(data.get("tag_name"), str):
+        raise TemplateLookupError("Unexpected GitHub latest release response")
+    version = data["tag_name"]
+    try:
+        parse_version(version)
+    except ValueError as exc:
+        raise TemplateLookupError(str(exc)) from exc
+    _cache_set(cache_set, key, version.encode("utf-8"), RELEASE_CHECK_TTL)
+    return version
+
+
+def get_template_contents(
+    paths: Set[str],
+    day: datetime.date,
+    version: str,
+    cache_get: CacheGet,
+    cache_set: CacheSet,
+    session: Optional[requests.Session] = None,
+) -> dict[str, bytes]:
+    """Fetch template YAMLs from main; cache each day's content for reuse across clients."""
+    session = session or requests.Session()
+    contents: dict[str, bytes] = {}
+    for path in sorted(paths):
+        path = _validate_template_path(path)
+        key = f"v5:template:{day.isoformat()}:{version}:{path}"
+        cached = cache_get(key)
+        if cached is not None:
+            contents[path] = cached
+            continue
+
+        encoded_path = quote(path, safe="/")
+        content = _request(session, f"{RAW}/main/{encoded_path}", raw=True)
+        if not isinstance(content, bytes) or not content:
+            raise TemplateLookupError(f"Empty or invalid template response for {path}")
+        _cache_set(cache_set, key, content)
+        contents[path] = content
+    return contents

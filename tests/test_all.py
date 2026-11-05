@@ -1,3 +1,4 @@
+import datetime
 from unittest import mock
 
 import pytest
@@ -5,31 +6,34 @@ import requests
 from sqlalchemy import create_engine  # type: ignore
 
 from cybercover.github_templates import (
+    CACHE_TTL,
     TemplateLookupError,
-    TooManyChangesError,
-    fetch_changed_templates,
-    get_changed_templates,
-    get_previous_release,
+    get_daily_additions,
+    get_template_contents,
     installed_templates_version,
+    latest_release,
     parse_version,
-    previous_release,
+    templates_to_scan,
 )
 from cybercover.state import ScanStateStore
 
 
 class FakeSession:
-    def __init__(self, responses):
-        self.responses = responses
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
 
     def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(url)
         response = mock.Mock()
-        response.json.return_value = self.responses(url, params)
         response.raise_for_status.return_value = None
+        response.json.return_value = self.response
+        response.content = self.response if isinstance(self.response, bytes) else b""
         return response
 
 
-def _files(*items):
-    return [{"filename": name, "status": status} for name, status in items]
+def _cache_set(cache, key, value, timeout=None):
+    cache[key] = value
 
 
 def test_parse_version_orders_numerically():
@@ -40,78 +44,124 @@ def test_parse_version_orders_numerically():
             parse_version(bad)
 
 
-def test_fetch_changed_templates_filters_by_status():
-    def responses(url, params):
-        assert url.endswith("/compare/v10.4.0...v10.5.0")
-        return {
-            "files": _files(
-                ("http/a.yaml", "added"),
-                ("http/b.yaml", "modified"),
-                ("http/c.yaml", "renamed"),
-                ("http/d.yaml", "removed"),
-                ("README.md", "added"),
-            )
-        }
+def test_daily_additions_is_cached_by_date_and_release():
+    cache = {}
+    ttl = []
+    session = FakeSession(b"http/a.yaml\nhttp/b.yml\n")
+    day = datetime.date(2026, 11, 5)
+    def cache_set(key, value, timeout=None):
+        ttl.append(timeout)
+        _cache_set(cache, key, value)
 
-    assert fetch_changed_templates("v10.4.0", "v10.5.0", FakeSession(responses)) == {
+    assert get_daily_additions(day, "v10.5.1", cache.get, cache_set, session) == {
         "http/a.yaml",
-        "http/b.yaml",
-        "http/c.yaml",
+        "http/b.yml",
     }
+    assert get_daily_additions(day, "v10.5.1", cache.get, cache_set, session) == {
+        "http/a.yaml",
+        "http/b.yml",
+    }
+    assert len(session.calls) == 1
+    assert any("v10.5.1" in key for key in cache)
+    assert ttl == [CACHE_TTL]
 
 
-def test_fetch_refuses_truncated_list():
-    full = {"files": _files(*[(f"http/{i}.yaml", "added") for i in range(300)])}
-    with pytest.raises(TooManyChangesError):
-        fetch_changed_templates("v10.4.0", "v10.5.0", FakeSession(lambda u, p: full))
-    ok = {"files": _files(*[(f"http/{i}.yaml", "added") for i in range(299)])}
-    assert len(fetch_changed_templates("v10.4.0", "v10.5.0", FakeSession(lambda u, p: ok))) == 299
+@pytest.mark.parametrize("bad_path", ["../outside.yaml", "/absolute.yaml", "http/README.md"])
+def test_additions_reject_invalid_paths(bad_path):
+    cache = {}
+    session = FakeSession(f"{bad_path}\n".encode())
+    with pytest.raises(TemplateLookupError):
+        get_daily_additions(
+            datetime.date(2026, 11, 5),
+            "v10.5.1",
+            cache.get,
+            lambda k, v, timeout=None: _cache_set(cache, k, v),
+            session,
+        )
 
 
-def test_fetch_errors_are_wrapped():
+def test_template_selection_for_first_scan_and_release_transition():
+    today = datetime.date(2026, 11, 5)
+    additions = {"http/a.yaml"}
+    assert templates_to_scan(None, None, "v10.5.1", today, additions, lambda _: None) == (additions, True)
+    assert templates_to_scan(
+        "v10.5.0",
+        datetime.datetime(2026, 11, 4, tzinfo=datetime.timezone.utc),
+        "v10.5.1",
+        today,
+        additions,
+        lambda _: None,
+    ) == (additions, True)
+
+
+def test_template_selection_diffs_daily_snapshots():
+    today = datetime.date(2026, 11, 5)
+    yesterday = datetime.date(2026, 11, 4)
+    additions = {"http/a.yaml", "http/b.yaml"}
+    old = {"http/a.yaml"}
+    cache = {f"v5:additions:{yesterday.isoformat()}:v10.5.1": b'["http/a.yaml"]'}
+    assert templates_to_scan(
+        "v10.5.1",
+        yesterday,
+        "v10.5.1",
+        today,
+        additions,
+        cache.get,
+    ) == ({"http/b.yaml"}, False)
+
+
+def test_template_selection_rescans_current_list_when_snapshot_was_evicted():
+    today = datetime.date(2026, 11, 5)
+    additions = {"http/a.yaml"}
+    assert templates_to_scan(
+        "v10.5.1",
+        datetime.date(2026, 11, 4),
+        "v10.5.1",
+        today,
+        additions,
+        lambda _: None,
+    ) == (additions, False)
+
+
+def test_same_day_scan_has_no_delta():
+    today = datetime.date(2026, 11, 5)
+    assert templates_to_scan(
+        "v10.5.1", today, "v10.5.1", today, {"http/a.yaml"}, lambda _: None
+    ) == (set(), False)
+
+
+def test_template_contents_are_cached_per_path_day_and_release():
+    cache = {}
+    session = FakeSession(b"id: test\n")
+    paths = {"http/test.yaml"}
+    day = datetime.date(2026, 11, 5)
+    fetch = lambda: get_template_contents(
+        paths, day, "v10.5.1", cache.get, lambda k, v, timeout=None: _cache_set(cache, k, v), session
+    )
+    assert fetch() == {"http/test.yaml": b"id: test\n"}
+    assert fetch() == {"http/test.yaml": b"id: test\n"}
+    assert len(session.calls) == 1
+
+
+def test_latest_release_is_cached():
+    cache = {}
+    session = FakeSession({"tag_name": "v10.5.1"})
+    assert latest_release(cache.get, lambda k, v, timeout=None: _cache_set(cache, k, v), session) == "v10.5.1"
+    latest_release(cache.get, lambda k, v, timeout=None: _cache_set(cache, k, v), session)
+    assert len(session.calls) == 1
+
+
+def test_request_errors_are_reported():
     session = mock.Mock()
     session.get.side_effect = requests.ConnectionError("down")
     with pytest.raises(TemplateLookupError):
-        fetch_changed_templates("v10.4.0", "v10.5.0", session)
-
-
-def test_previous_release_picks_newest_older_tag():
-    releases = [{"tag_name": t} for t in ("v10.5.1", "v10.5.0", "v10.4.9", "junk", "v10.10.0")]
-    session = FakeSession(lambda u, p: releases)
-    assert previous_release("v10.5.1", session) == "v10.5.0"
-    assert previous_release("v10.10.0", session) == "v10.5.1"
-    with pytest.raises(TemplateLookupError):
-        previous_release("v10.4.9", session)
-
-
-def test_cache_is_used_for_second_lookup():
-    store = {}
-    with mock.patch("cybercover.github_templates.fetch_changed_templates", return_value={"a.yaml"}) as fetch:
-        args = ("v10.4.0", "v10.5.0", store.get, lambda k, v: store.__setitem__(k, v))
-        assert get_changed_templates(*args) == {"a.yaml"}
-        assert get_changed_templates(*args) == {"a.yaml"}
-    assert fetch.call_count == 1
-
-
-def test_too_many_changes_is_cached():
-    store = {}
-    args = ("v10.0.0", "v10.5.0", store.get, lambda k, v: store.__setitem__(k, v))
-    with mock.patch(
-        "cybercover.github_templates.fetch_changed_templates", side_effect=TooManyChangesError("x")
-    ) as fetch:
-        for _ in range(2):
-            with pytest.raises(TooManyChangesError):
-                get_changed_templates(*args)
-    assert fetch.call_count == 1
-
-
-def test_previous_release_is_cached():
-    store = {}
-    with mock.patch("cybercover.github_templates.previous_release", return_value="v10.5.0") as prev:
-        args = ("v10.5.1", store.get, lambda k, v: store.__setitem__(k, v))
-        assert get_previous_release(*args) == "v10.5.0"
-        assert get_previous_release(*args) == "v10.5.0"
-    assert prev.call_count == 1
+        get_daily_additions(
+            datetime.date(2026, 11, 5),
+            "v10.5.1",
+            lambda _: None,
+            lambda *args, **kwargs: None,
+            session,
+        )
 
 
 def test_installed_version(tmp_path):
@@ -123,20 +173,28 @@ def test_installed_version(tmp_path):
 
 def test_state_store_roundtrip():
     store = ScanStateStore(engine=create_engine("sqlite://"))
-    assert store.get_versions(["a:80"]) == {}
+    assert store.get_states(["a:80"]) == {}
     store.set_versions(["a:80", "b:443"], "v10.5.0")
-    store.set_versions(["a:80"], "v10.5.1")
-    assert store.get_versions(["a:80", "b:443", "c:1"]) == {"a:80": "v10.5.1", "b:443": "v10.5.0"}
+    states = store.get_states(["a:80", "b:443", "c:1"])
+    assert {target: value[0] for target, value in states.items()} == {"a:80": "v10.5.0", "b:443": "v10.5.0"}
+    assert all(isinstance(value[1], datetime.datetime) for value in states.values())
 
 
 def _module():
     from cybercover.modules.cybercover_nuclei import CybercoverNuclei
 
-    module = CybercoverNuclei.__new__(CybercoverNuclei)  # skip the heavy Nuclei.__init__
+    module = CybercoverNuclei.__new__(CybercoverNuclei)
     module._state = ScanStateStore(engine=create_engine("sqlite://"))
     module.cache = mock.Mock()
     module.cache.get.return_value = None
     module.save_task_result = mock.Mock()
+    module.lock = mock.MagicMock()
+    module._incremental = False
+    module._custom_template_paths = {}
+    module._native_templates = set()
+    module._native_dast_templates = set()
+    module._include_native_new_templates = False
+    module._native_scanned_categories = set()
     return module
 
 
@@ -154,108 +212,150 @@ def _mock_log():
         yield
 
 
-def test_scan_filters_templates_and_skips_workflows():
+def test_scan_supplies_cached_custom_and_native_nt_templates(tmp_path):
+    from artemis.modules.nuclei import ScanUsing
+
+    module = _module()
+    custom = tmp_path / "custom.yaml"
+    custom.write_text("id: custom")
+    module._incremental = True
+    module._custom_template_paths = {"http/custom.yaml": str(custom)}
+    module._native_templates = {"http/native.yaml"}
+    module._include_native_new_templates = True
+    module._severity_levels = ["high", "critical"]
+    with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
+        module._scan(
+            ["/root/nuclei-templates/http/old.yaml"],
+            ScanUsing.TEMPLATES,
+            ["https://example.com"],
+            extra_nuclei_args=["-itags", "cve"],
+        )
+    assert parent.call_args.args[0] == [str(custom), "http/native.yaml"]
+    assert parent.call_args.kwargs["extra_nuclei_args"] == [
+        "-itags",
+        "cve",
+        "-severity",
+        "high,critical",
+        "-nt",
+    ]
+
+
+def test_scan_keeps_dast_templates_separate():
     from artemis.modules.nuclei import ScanUsing
 
     module = _module()
     module._incremental = True
-    module._changed = {"http/cves/new.yaml"}
+    module._custom_template_paths = {
+        "http/custom.yaml": "/tmp/custom.yaml",
+        "dast/custom.yaml": "/tmp/dast.yaml",
+    }
+    module._native_templates = {"http/native.yaml"}
+    module._native_dast_templates = {"dast/native.yaml"}
+    module._include_native_new_templates = True
+    module._severity_levels = ["high"]
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan(
-            ["/root/nuclei-templates/http/cves/new.yaml", "http/cves/old.yaml", "/custom/x.yaml"],
+            ["dast/old.yaml"],
             ScanUsing.TEMPLATES,
-            ["t"],
+            ["https://example.com"],
+            extra_nuclei_args=["-dast"],
         )
-        assert module._scan(["/workflows"], ScanUsing.WORKFLOWS, ["t"]) == []
-    assert parent.call_count == 1
-    assert parent.call_args.args[0] == ["/root/nuclei-templates/http/cves/new.yaml"]
+    assert parent.call_args.args[0] == ["/tmp/dast.yaml", "dast/native.yaml"]
+    assert parent.call_args.kwargs["extra_nuclei_args"] == ["-dast", "-severity", "high", "-nt"]
 
 
-def test_scan_is_unfiltered_when_not_incremental():
-    from artemis.modules.nuclei import ScanUsing
-
+def test_new_release_runs_nuclei_template_updater():
     module = _module()
-    with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
-        module._scan(["a.yaml", "b.yaml"], ScanUsing.TEMPLATES, ["t"])
-    assert parent.call_args.args[0] == ["a.yaml", "b.yaml"]
-
-
-def _run(module, tasks, changed=None, head="v10.5.1", previous="v10.5.0"):
-    seen = []
-    if isinstance(changed, Exception):
-        lookup = mock.Mock(side_effect=changed)
-    else:
-        lookup = mock.Mock(side_effect=lambda after, h, *a: changed[after])
     with mock.patch(
-        "cybercover.modules.cybercover_nuclei.installed_templates_version", return_value=head
+        "cybercover.modules.cybercover_nuclei.latest_release", return_value="v10.6.0"
     ), mock.patch(
-        "cybercover.modules.cybercover_nuclei.get_previous_release", return_value=previous
+        "cybercover.modules.cybercover_nuclei.installed_templates_version",
+        return_value="v10.6.0",
     ), mock.patch(
-        "cybercover.modules.cybercover_nuclei.get_changed_templates", lookup
-    ), mock.patch(
-        "artemis.modules.nuclei.Nuclei.run_multiple",
-        lambda self, t: seen.append((self._incremental, self._changed, len(t))),
+        "cybercover.modules.cybercover_nuclei.directory_backup"
+    ) as backup, mock.patch(
+        "cybercover.modules.cybercover_nuclei.subprocess.check_call"
+    ) as update:
+        assert module._update_templates_if_needed("v10.5.1") == "v10.6.0"
+    backup.assert_called_once()
+    update.assert_called_once_with(["nuclei", "-update-templates"])
+
+
+def test_native_new_template_listing_respects_severity_configuration():
+    module = _module()
+    configuration = mock.Mock()
+    configuration.get_severity_options.return_value = ["high", "critical"]
+    module.get_runtime_configuration = mock.Mock(return_value=configuration)
+    calls = []
+
+    def list_templates(command, logger):
+        calls.append(command)
+        if "-dast" in command:
+            return b"dast/one.yaml\n"
+        return f"{command[2]}/one.yaml\n".encode()
+
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.check_output_log_on_error",
+        side_effect=list_templates,
     ):
-        module.run_multiple(tasks)
-    return seen
+        regular, dast = module._list_native_new_templates([_task("example.com")])
+    assert regular == {"high/one.yaml", "critical/one.yaml"}
+    assert dast == {"dast/one.yaml"}
+    assert len(calls) == 3
+    assert all("-nt" in call for call in calls)
 
 
-def test_new_target_starts_from_previous_release_and_state_is_saved():
-    module = _module()
-    seen = _run(module, [_task("a.pl")], changed={"v10.5.0": {"x.yaml"}})
-    assert seen == [(True, {"x.yaml"}, 1)]
-    assert module.state.get_versions(["a.pl:80"]) == {"a.pl:80": "v10.5.1"}
-    assert module._changed is None and module._incremental is False
-
-
-def test_known_targets_are_grouped_by_their_version():
-    module = _module()
-    module.state.set_versions(["old.pl:80"], "v10.4.0")
-    module.state.set_versions(["same.pl:80"], "v10.5.1")
-    seen = _run(
-        module,
-        [_task("old.pl"), _task("same.pl"), _task("new.pl"), _task("old.pl", 8080)],
-        changed={"v10.4.0": {"o.yaml"}, "v10.5.0": {"n.yaml"}},
-    )
-    assert sorted(seen, key=lambda s: sorted(s[1])) == [(True, {"n.yaml"}, 2), (True, {"o.yaml"}, 1)]
-    # same.pl is already up to date: no scan, OK result
-    assert module.save_task_result.call_args.kwargs["status_reason"] == "No new templates"
-    assert set(module.state.get_versions(["old.pl:80", "same.pl:80", "new.pl:80", "old.pl:8080"]).values()) == {"v10.5.1"}
-
-
-def test_too_many_changes_falls_back_to_full_scan():
-    module = _module()
-    module.state.set_versions(["a.pl:80"], "v10.0.0")
-    seen = _run(module, [_task("a.pl")], changed=TooManyChangesError("big"))
-    assert seen == [(False, None, 1)]
-    assert module.state.get_versions(["a.pl:80"]) == {"a.pl:80": "v10.5.1"}
-
-
-def test_lookup_error_reports_error_and_keeps_state():
+def test_no_changes_saves_success_and_advances_state():
     from artemis.binds import TaskStatus
 
     module = _module()
-    module.state.set_versions(["a.pl:80"], "v10.4.0")
-    seen = _run(module, [_task("a.pl")], changed=TemplateLookupError("down"))
-    assert seen == []
+    task = _task("example.com")
+    day = datetime.date(2026, 11, 5)
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=(set(), False)
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_template_contents", return_value={}
+    ):
+        module._run_group([task], "v10.5.1", day, "v10.5.1", day, set())
+    assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.OK
+    assert module.state.get_versions(["example.com:80"]) == {"example.com:80": "v10.5.1"}
+
+
+def test_run_group_keeps_state_if_template_lookup_fails():
+    from artemis.binds import TaskStatus
+
+    module = _module()
+    task = _task("example.com")
+    module.state.set_versions(["example.com:80"], "v10.5.0")
+    day = datetime.date(2026, 11, 5)
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan",
+        side_effect=TemplateLookupError("GitHub unavailable"),
+    ):
+        module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
     assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.ERROR
-    assert module.state.get_versions(["a.pl:80"]) == {"a.pl:80": "v10.4.0"}
+    assert module.state.get_versions(["example.com:80"]) == {"example.com:80": "v10.5.0"}
 
 
-def test_failed_scan_keeps_state():
+def test_run_group_scans_cached_yaml_then_saves_version(tmp_path):
     module = _module()
-    module.state.set_versions(["a.pl:80"], "v10.4.0")
-    with mock.patch("cybercover.modules.cybercover_nuclei.installed_templates_version", return_value="v10.5.1"), mock.patch(
-        "cybercover.modules.cybercover_nuclei.get_changed_templates", return_value={"x.yaml"}
-    ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple", side_effect=RuntimeError("nuclei crashed")):
-        with pytest.raises(RuntimeError):
-            module.run_multiple([_task("a.pl")])
-    assert module.state.get_versions(["a.pl:80"]) == {"a.pl:80": "v10.4.0"}
-    assert module._changed is None and module._incremental is False
+    task = _task("example.com")
+    day = datetime.date(2026, 11, 5)
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan",
+        return_value=({"http/a.yaml"}, False),
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_template_contents",
+        return_value={"http/a.yaml": b"id: template\n"},
+    ), mock.patch(
+        "artemis.modules.nuclei.Nuclei.run_multiple",
+        side_effect=lambda tasks: (
+            Path(next(iter(module._custom_template_paths.values()))).read_text(),
+            module.save_task_result(task=tasks[0], status=mock.sentinel.ok, data=[]),
+        ),
+    ) as scan:
+        from pathlib import Path
 
-
-def test_unknown_installed_version_reports_error():
-    module = _module()
-    seen = _run(module, [_task("a.pl")], changed={}, head=None)
-    assert seen == []
-    assert module.save_task_result.call_count == 1
+        module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
+    assert scan.call_count == 1
+    assert module.state.get_versions(["example.com:80"]) == {"example.com:80": "v10.5.1"}
