@@ -191,10 +191,7 @@ def _module():
     module.lock = mock.MagicMock()
     module._incremental = False
     module._custom_template_paths = {}
-    module._native_templates = set()
-    module._native_dast_templates = set()
     module._include_native_new_templates = False
-    module._native_scanned_categories = set()
     return module
 
 
@@ -220,7 +217,6 @@ def test_scan_supplies_cached_custom_and_native_nt_templates(tmp_path):
     custom.write_text("id: custom")
     module._incremental = True
     module._custom_template_paths = {"http/custom.yaml": str(custom)}
-    module._native_templates = {"http/native.yaml"}
     module._include_native_new_templates = True
     module._severity_levels = ["high", "critical"]
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
@@ -230,7 +226,7 @@ def test_scan_supplies_cached_custom_and_native_nt_templates(tmp_path):
             ["https://example.com"],
             extra_nuclei_args=["-itags", "cve"],
         )
-    assert parent.call_args.args[0] == [str(custom), "http/native.yaml"]
+    assert parent.call_args.args[0] == [str(custom)]
     assert parent.call_args.kwargs["extra_nuclei_args"] == [
         "-itags",
         "cve",
@@ -249,8 +245,6 @@ def test_scan_keeps_dast_templates_separate():
         "http/custom.yaml": "/tmp/custom.yaml",
         "dast/custom.yaml": "/tmp/dast.yaml",
     }
-    module._native_templates = {"http/native.yaml"}
-    module._native_dast_templates = {"dast/native.yaml"}
     module._include_native_new_templates = True
     module._severity_levels = ["high"]
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
@@ -260,7 +254,7 @@ def test_scan_keeps_dast_templates_separate():
             ["https://example.com"],
             extra_nuclei_args=["-dast"],
         )
-    assert parent.call_args.args[0] == ["/tmp/dast.yaml", "dast/native.yaml"]
+    assert parent.call_args.args[0] == ["/tmp/dast.yaml"]
     assert parent.call_args.kwargs["extra_nuclei_args"] == ["-dast", "-severity", "high", "-nt"]
 
 
@@ -281,28 +275,17 @@ def test_new_release_runs_nuclei_template_updater():
     update.assert_called_once_with(["nuclei", "-update-templates"])
 
 
-def test_native_new_template_listing_respects_severity_configuration():
+def test_native_nt_without_custom_templates_uses_placeholder():
+    from artemis.modules.nuclei import ScanUsing
+    from cybercover.modules.cybercover_nuclei import NEW_ADDITIONS_PLACEHOLDER
+
     module = _module()
-    configuration = mock.Mock()
-    configuration.get_severity_options.return_value = ["high", "critical"]
-    module.get_runtime_configuration = mock.Mock(return_value=configuration)
-    calls = []
-
-    def list_templates(command, logger):
-        calls.append(command)
-        if "-dast" in command:
-            return b"dast/one.yaml\n"
-        return f"{command[2]}/one.yaml\n".encode()
-
-    with mock.patch(
-        "cybercover.modules.cybercover_nuclei.check_output_log_on_error",
-        side_effect=list_templates,
-    ):
-        regular, dast = module._list_native_new_templates([_task("example.com")])
-    assert regular == {"high/one.yaml", "critical/one.yaml"}
-    assert dast == {"dast/one.yaml"}
-    assert len(calls) == 3
-    assert all("-nt" in call for call in calls)
+    module._incremental = True
+    module._include_native_new_templates = True
+    with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
+        module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=[])
+    assert parent.call_args.args[0] == [NEW_ADDITIONS_PLACEHOLDER]
+    assert "-nt" in parent.call_args.kwargs["extra_nuclei_args"]
 
 
 def test_no_changes_saves_success_and_advances_state():

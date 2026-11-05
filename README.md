@@ -26,8 +26,8 @@ second Nuclei scan.
    from that target's last scan date. Only paths newly present in today's list are selected.
    If the old daily snapshot has expired or Redis lost it, the worker scans today's full list
    rather than risk skipping additions.
-4. For a first scan or a release transition, it also obtains Nuclei's native `-nt` template
-   list. Changes listed in today's `.new-additions` are fetched from GitHub `main`, cached per
+4. For a first scan or a release transition, Nuclei is also run with its native `-nt` flag
+   (new templates of the installed release). Changes listed in today's `.new-additions` are fetched from GitHub `main`, cached per
    file for 30 days, and passed to Nuclei as explicit template paths.
 5. After a successful scan (or a successful no-change result), it stores the installed release
    and current scan time. Lookup or scan errors do not advance the state.

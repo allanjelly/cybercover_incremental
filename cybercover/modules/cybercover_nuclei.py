@@ -12,8 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError  # type: ignore
 from artemis import load_risk_class
 from artemis.binds import TaskStatus
 from artemis.modules.nuclei import Nuclei, ScanUsing
-from artemis.modules.runtime_configuration.nuclei_configuration import SeverityThreshold
-from artemis.utils import check_output_log_on_error, directory_backup
+from artemis.utils import directory_backup
 
 from cybercover.github_templates import (
     TemplateLookupError,
@@ -25,6 +24,9 @@ from cybercover.github_templates import (
     templates_to_scan,
 )
 from cybercover.state import ScanStateStore
+
+
+NEW_ADDITIONS_PLACEHOLDER = "/root/nuclei-templates/.new-additions"
 
 
 def target_key(task: Task) -> str:
@@ -46,8 +48,6 @@ class CybercoverNuclei(Nuclei):
     identity = "cybercover_nuclei"
 
     _custom_template_paths: Dict[str, str] = {}
-    _native_templates: Set[str] = set()
-    _native_dast_templates: Set[str] = set()
     _severity_levels: List[str] = []
     _incremental = False
     _include_native_new_templates = False
@@ -80,20 +80,22 @@ class CybercoverNuclei(Nuclei):
             for path, local_path in self._custom_template_paths.items()
             if path.startswith("dast/") == is_dast
         ]
-        native_templates = self._native_dast_templates if is_dast else self._native_templates
         extra_nuclei_args = list(extra_nuclei_args)
         if self._severity_levels:
             extra_nuclei_args.extend(["-severity", ",".join(self._severity_levels)])
         if self._include_native_new_templates:
-            selected.extend(sorted(native_templates))
             extra_nuclei_args.append("-nt")
+            if not selected:
+                # The stock _scan skips empty template lists; nuclei ignores this config file as a template
+                # and adds the installed release's new templates because of -nt.
+                selected.append(NEW_ADDITIONS_PLACEHOLDER)
         kwargs["extra_nuclei_args"] = extra_nuclei_args
 
         self.log.info(
-            "Incremental %s scan: %d custom templates and %d native release templates",
+            "Incremental %s scan: %d custom templates, native -nt=%s",
             category,
             len([path for path in self._custom_template_paths if path.startswith("dast/") == is_dast]),
-            len(native_templates) if self._include_native_new_templates else 0,
+            self._include_native_new_templates,
         )
         return super()._scan(selected, scan_using, targets, *args, **kwargs)
 
@@ -126,20 +128,6 @@ class CybercoverNuclei(Nuclei):
                 f"Template update did not install the latest release {remote}; installed version is {updated!r}"
             )
         return updated
-
-    def _list_native_new_templates(self, tasks: List[Task]) -> tuple[Set[str], Set[str]]:
-        severity_levels = self.get_runtime_configuration(tasks[0]).get_severity_options()
-        regular_paths: Set[str] = set()
-        for severity in SeverityThreshold.get_severity_list(SeverityThreshold.ALL):
-            if severity not in severity_levels:
-                continue
-            listed = check_output_log_on_error(["nuclei", "-s", severity, "-tl", "-nt"], self.log)
-            regular_paths.update(
-                path for path in listed.decode("utf-8").split() if path.endswith((".yaml", ".yml"))
-            )
-        dast = check_output_log_on_error(["nuclei", "-dast", "-tl", "-nt"], self.log).decode("utf-8").split()
-        dast_paths = {path for path in dast if path.endswith((".yaml", ".yml")) and path.startswith("dast/")}
-        return regular_paths, dast_paths
 
     def run_multiple(self, tasks: List[Task]) -> None:
         if not tasks:
@@ -180,10 +168,6 @@ class CybercoverNuclei(Nuclei):
                 after_version, last_scanned_at, head, today, additions, self.cache.get
             )
             contents = get_template_contents(changed, today, head, self.cache.get, self.cache.set)
-            if use_native_nt:
-                native_templates, native_dast_templates = self._list_native_new_templates(tasks)
-            else:
-                native_templates, native_dast_templates = set(), set()
         except (TemplateLookupError, OSError, subprocess.CalledProcessError, ValueError) as exc:
             self._fail(tasks, str(exc))
             return
@@ -214,8 +198,6 @@ class CybercoverNuclei(Nuclei):
                     custom_paths[relative_path] = str(destination)
 
                 self._custom_template_paths = custom_paths
-                self._native_templates = native_templates
-                self._native_dast_templates = native_dast_templates
                 self._severity_levels = self.get_runtime_configuration(tasks[0]).get_severity_options()
                 self._incremental = True
                 self._include_native_new_templates = use_native_nt
@@ -224,8 +206,6 @@ class CybercoverNuclei(Nuclei):
                     self.state.set_versions((target_key(task) for task in tasks), head)
                 finally:
                     self._custom_template_paths = {}
-                    self._native_templates = set()
-                    self._native_dast_templates = set()
                     self._severity_levels = []
                     self._incremental = False
                     self._include_native_new_templates = False
