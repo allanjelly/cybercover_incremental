@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set
 
+import yaml
 from karton.core import Task
 from prometheus_client import start_http_server
 from sqlalchemy.exc import SQLAlchemyError  # type: ignore
@@ -19,6 +20,7 @@ from artemis.utils import CalledProcessErrorWithMessage, directory_backup
 
 from cybercover.github_templates import (
     TemplateLookupError,
+    _parse_additions,
     get_daily_additions,
     get_template_contents,
     installed_templates_version,
@@ -29,7 +31,41 @@ from cybercover.github_templates import (
 from cybercover.state import ScanStateStore
 
 
-NEW_ADDITIONS_PLACEHOLDER = "/root/nuclei-templates/.new-additions"
+ALLOWED_SEVERITIES = {"high", "critical"}
+
+
+def filter_templates(
+    contents: Dict[str, bytes], severity_levels: Set[str]
+) -> tuple[Dict[str, bytes], Dict[str, Set[str]]]:
+    selected: Dict[str, bytes] = {}
+    tags_by_path: Dict[str, Set[str]] = {}
+    for path, content in contents.items():
+        try:
+            template = yaml.safe_load(content)
+        except (yaml.YAMLError, UnicodeDecodeError) as exc:
+            raise TemplateLookupError(f"Invalid template YAML {path}: {exc}") from exc
+        if not isinstance(template, dict) or not isinstance(template.get("info"), dict):
+            raise TemplateLookupError(f"Missing template metadata in {path}")
+        info = template["info"]
+        severity = info.get("severity")
+        if not isinstance(severity, str):
+            raise TemplateLookupError(f"Missing or invalid template severity in {path}")
+        if severity.lower() not in severity_levels or path.startswith("headless/") or "headless" in template:
+            continue
+        tags = info.get("tags", [])
+        if isinstance(tags, str):
+            tags = tags.split(",")
+        if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+            raise TemplateLookupError(f"Invalid template tags in {path}")
+        selected[path] = content
+        tags_by_path[path] = {tag.strip().lower() for tag in tags if tag.strip()}
+    return selected, tags_by_path
+
+
+def release_template_contents(root: str) -> Dict[str, bytes]:
+    directory = Path(root)
+    paths = _parse_additions((directory / ".new-additions").read_bytes())
+    return {path: (directory / path).read_bytes() for path in sorted(paths)}
 
 
 def target_key(task: Task) -> str:
@@ -42,8 +78,8 @@ class CybercoverNuclei(Nuclei):
     Incremental scan using daily changes from nuclei-templates/.new-additions.
 
     The worker remembers a last-scan date and release per host:port. It downloads changed YAML
-    files from GitHub as custom templates; on first scans and release transitions it also uses
-    Nuclei's native -nt selection for the installed release.
+    files from GitHub as custom templates; on first scans and release transitions it also reads
+    the installed release's native new-template list.
 
     Disabled by default (add it to MODULES_DISABLED_BY_DEFAULT) - enable it explicitly through /api/add.
     """
@@ -51,9 +87,9 @@ class CybercoverNuclei(Nuclei):
     identity = "cybercover_nuclei"
 
     _custom_template_paths: Dict[str, str] = {}
+    _template_tags: Dict[str, Set[str]] = {}
     _severity_levels: List[str] = []
     _incremental = False
-    _use_native_nt = False
     _scanned_categories: Set[bool] = set()
     _nuclei_failures = 0
     _state: Optional[ScanStateStore] = None
@@ -99,51 +135,48 @@ class CybercoverNuclei(Nuclei):
 
         # The stock run_multiple scans the whole template list once per category and then repeats
         # scans on homepage links with a short template list. Link scans may only use the changed
-        # templates that are also on that list and never the native -nt selection.
+        # templates that are also on that list.
         is_link_scan = is_dast in self._scanned_categories
         self._scanned_categories.add(is_dast)
 
+        excluded_tags: Set[str] = set()
+        included_tags: Set[str] = set()
+        for index, flag in enumerate(extra_nuclei_args[:-1]):
+            if flag in ("-etags", "-exclude-tags"):
+                excluded_tags.update(tag.strip().lower() for tag in extra_nuclei_args[index + 1].split(","))
+            elif flag in ("-itags", "-include-tags"):
+                included_tags.update(tag.strip().lower() for tag in extra_nuclei_args[index + 1].split(","))
+        excluded_tags -= included_tags
         selected = [
             local_path
             for path, local_path in self._custom_template_paths.items()
             if path.startswith("dast/") == is_dast
             and (not is_link_scan or NUCLEI_TEMPLATES_LOCATION + path in templates_or_workflows)
+            and not (self._template_tags.get(path, set()) & excluded_tags)
         ]
         if self._severity_levels:
             extra_nuclei_args.extend(["-severity", ",".join(self._severity_levels)])
-        use_native_nt = self._use_native_nt and not is_link_scan
-        if use_native_nt and is_dast:
-            # DAST runs with a fake HOME without the templates directory, so -nt cannot resolve its
-            # list there. We read the release's .new-additions ourselves and pass absolute paths.
-            selected.extend(self._native_dast_templates())
-        elif use_native_nt:
-            extra_nuclei_args.append("-nt")
-            if not selected:
-                # The stock _scan skips empty template lists; nuclei ignores this config file as a template
-                # and adds the installed release's new templates because of -nt.
-                selected.append(NEW_ADDITIONS_PLACEHOLDER)
         if not selected:
+            self.log.info("No eligible incremental templates for %s scan", "dast" if is_dast else "templates")
             return []
+        extra_nuclei_args.extend(["-new-templates=false", "-new-templates-version=", "-headless=false"])
         kwargs["extra_nuclei_args"] = extra_nuclei_args
 
         self.log.info(
-            "Incremental %s %s scan: %d custom templates, native -nt=%s",
+            "Incremental %s %s scan: %d eligible templates",
             "dast" if is_dast else "templates",
             "link" if is_link_scan else "main",
             len(selected),
-            use_native_nt,
         )
         return super()._scan(selected, scan_using, targets, *args, **kwargs)
 
-    @staticmethod
-    def _native_dast_templates() -> List[str]:
-        try:
-            with open(NUCLEI_TEMPLATES_LOCATION + ".new-additions", encoding="utf-8") as f:
-                lines = [line.strip() for line in f]
-        except OSError:
-            return []
-        paths = [NUCLEI_TEMPLATES_LOCATION + line for line in lines if line.startswith("dast/")]
-        return [path for path in paths if os.path.isfile(path)]
+    def save_task_result(
+        self, task: Task, *, status: TaskStatus, status_reason: Optional[str] = None, data: Optional[Any] = None
+    ) -> None:
+        if self._incremental and self._nuclei_failures:
+            status = TaskStatus.ERROR
+            status_reason = f"{self._nuclei_failures} Nuclei runs failed; results may be incomplete"
+        super().save_task_result(task=task, status=status, status_reason=status_reason, data=data)
 
     def _fail(self, tasks: List[Task], reason: str) -> None:
         self.log.error("Skipping tasks: %s", reason)
@@ -214,6 +247,18 @@ class CybercoverNuclei(Nuclei):
                 last_version, last_scan_date, installed_version, today, additions, self.cache.get
             )
             contents = get_template_contents(changed, today, installed_version, self.cache.get, self.cache.set)
+            downloaded_count = len(contents)
+            release_paths: Set[str] = set()
+            if use_native_nt:
+                release_contents = release_template_contents(NUCLEI_TEMPLATES_LOCATION)
+                release_paths = set(release_contents) - set(contents)
+                release_contents.update(contents)
+                contents = release_contents
+            severity_levels = [
+                level for level in self.get_runtime_configuration(tasks[0]).get_severity_options()
+                if level in ALLOWED_SEVERITIES
+            ]
+            contents, tags_by_path = filter_templates(contents, set(severity_levels))
         except (TemplateLookupError, OSError, subprocess.CalledProcessError, ValueError) as exc:
             self._fail(tasks, str(exc))
             return
@@ -223,31 +268,37 @@ class CybercoverNuclei(Nuclei):
             task.add_payload("templates_version", installed_version, persistent=True)
 
         self.log.info(
-            "%d targets: %d changed templates (%d downloaded) since %s (installed %s; native -nt=%s)",
+            "%d targets: %d changed templates (%d downloaded), %d eligible since %s (installed %s; release list=%s)",
             len(tasks),
             len(changed),
+            downloaded_count,
             len(contents),
             last_scan_date,
             installed_version,
             use_native_nt,
         )
-        if not contents and not use_native_nt:
+        if not contents:
             for task in tasks:
-                self.save_task_result(task=task, status=TaskStatus.OK, status_reason="No new templates", data=[])
+                self.save_task_result(
+                    task=task, status=TaskStatus.OK, status_reason="No eligible new templates", data=[]
+                )
             self.state.set_versions((target_key(task) for task in tasks), installed_version)
         else:
             with tempfile.TemporaryDirectory(prefix="cybercover-nuclei-") as directory:
                 custom_paths: Dict[str, str] = {}
                 for relative_path, content in contents.items():
-                    destination = Path(directory) / relative_path
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_bytes(content)
+                    if relative_path in release_paths:
+                        destination = Path(NUCLEI_TEMPLATES_LOCATION) / relative_path
+                    else:
+                        destination = Path(directory) / relative_path
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(content)
                     custom_paths[relative_path] = str(destination)
 
                 self._custom_template_paths = custom_paths
-                self._severity_levels = self.get_runtime_configuration(tasks[0]).get_severity_options()
+                self._template_tags = tags_by_path
+                self._severity_levels = severity_levels
                 self._incremental = True
-                self._use_native_nt = use_native_nt
                 self._scanned_categories = set()
                 self._nuclei_failures = 0
                 try:
@@ -263,9 +314,9 @@ class CybercoverNuclei(Nuclei):
                         self.state.set_versions((target_key(task) for task in tasks), installed_version)
                 finally:
                     self._custom_template_paths = {}
+                    self._template_tags = {}
                     self._severity_levels = []
                     self._incremental = False
-                    self._use_native_nt = False
                     self._scanned_categories = set()
 
 

@@ -184,6 +184,7 @@ def test_state_store_roundtrip():
 
 def _module():
     from cybercover.modules.cybercover_nuclei import CybercoverNuclei
+    from artemis.modules.runtime_configuration.nuclei_configuration import NucleiConfiguration
 
     module = CybercoverNuclei.__new__(CybercoverNuclei)
     module._state = ScanStateStore(engine=create_engine("sqlite://"))
@@ -195,7 +196,9 @@ def _module():
     module._scanned_categories = set()
     module._nuclei_failures = 0
     module._custom_template_paths = {}
-    module._use_native_nt = False
+    module._template_tags = {}
+    module._severity_levels = ["critical", "high"]
+    module.get_runtime_configuration = mock.Mock(return_value=NucleiConfiguration())
     return module
 
 
@@ -217,7 +220,7 @@ def _mock_log():
         yield
 
 
-def test_scan_supplies_cached_custom_and_native_nt_templates(tmp_path):
+def test_scan_supplies_filtered_custom_templates_without_native_nt(tmp_path):
     from artemis.modules.nuclei import ScanUsing
 
     module = _module()
@@ -225,7 +228,6 @@ def test_scan_supplies_cached_custom_and_native_nt_templates(tmp_path):
     custom.write_text("id: custom")
     module._incremental = True
     module._custom_template_paths = {"http/custom.yaml": str(custom)}
-    module._use_native_nt = True
     module._severity_levels = ["high", "critical"]
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan(
@@ -240,7 +242,9 @@ def test_scan_supplies_cached_custom_and_native_nt_templates(tmp_path):
         "cve",
         "-severity",
         "high,critical",
-        "-nt",
+        "-new-templates=false",
+        "-new-templates-version=",
+        "-headless=false",
     ]
 
 
@@ -253,7 +257,6 @@ def test_scan_keeps_dast_templates_separate():
         "http/custom.yaml": "/tmp/custom.yaml",
         "dast/custom.yaml": "/tmp/dast.yaml",
     }
-    module._use_native_nt = True
     module._severity_levels = ["high"]
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan(
@@ -263,7 +266,9 @@ def test_scan_keeps_dast_templates_separate():
             extra_nuclei_args=["-dast"],
         )
     assert parent.call_args.args[0] == ["/tmp/dast.yaml"]
-    assert parent.call_args.kwargs["extra_nuclei_args"] == ["-dast", "-severity", "high"]
+    assert parent.call_args.kwargs["extra_nuclei_args"] == [
+        "-dast", "-severity", "high", "-new-templates=false", "-new-templates-version=", "-headless=false"
+    ]
 
 
 def test_new_release_runs_nuclei_template_updater():
@@ -283,17 +288,14 @@ def test_new_release_runs_nuclei_template_updater():
     update.assert_called_once_with(["nuclei", "-update-templates"])
 
 
-def test_native_nt_without_custom_templates_uses_placeholder():
+def test_empty_selection_does_not_invoke_nuclei():
     from artemis.modules.nuclei import ScanUsing
-    from cybercover.modules.cybercover_nuclei import NEW_ADDITIONS_PLACEHOLDER
 
     module = _module()
     module._incremental = True
-    module._use_native_nt = True
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=[])
-    assert parent.call_args.args[0] == [NEW_ADDITIONS_PLACEHOLDER]
-    assert "-nt" in parent.call_args.kwargs["extra_nuclei_args"]
+    parent.assert_not_called()
 
 
 def test_no_changes_saves_success_and_advances_state():
@@ -337,7 +339,7 @@ def test_run_group_scans_cached_yaml_then_saves_version(tmp_path):
         return_value=({"http/a.yaml"}, False),
     ), mock.patch(
         "cybercover.modules.cybercover_nuclei.get_template_contents",
-        return_value={"http/a.yaml": b"id: template\n"},
+        return_value={"http/a.yaml": b"id: template\ninfo:\n  severity: high\n"},
     ), mock.patch(
         "artemis.modules.nuclei.Nuclei.run_multiple",
         side_effect=lambda tasks: (
@@ -365,7 +367,6 @@ def test_link_scan_uses_only_changed_templates_from_the_homepage_list_without_nt
 
     module = _module()
     module._incremental = True
-    module._use_native_nt = True
     module._custom_template_paths = {"http/a.yaml": "/tmp/a.yaml", "http/b.yaml": "/tmp/b.yaml"}
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=[])
@@ -375,7 +376,7 @@ def test_link_scan_uses_only_changed_templates_from_the_homepage_list_without_nt
         module._scan([NUCLEI_TEMPLATES_LOCATION + "http/other.yaml"], ScanUsing.TEMPLATES, ["https://example.com/y"])
     assert parent.call_count == 2
     assert sorted(parent.call_args_list[0].args[0]) == ["/tmp/a.yaml", "/tmp/b.yaml"]
-    assert "-nt" in parent.call_args_list[0].kwargs["extra_nuclei_args"]
+    assert "-nt" not in parent.call_args_list[0].kwargs["extra_nuclei_args"]
     assert parent.call_args_list[1].args[0] == ["/tmp/b.yaml"]
     assert "-nt" not in parent.call_args_list[1].kwargs["extra_nuclei_args"]
 
@@ -399,7 +400,8 @@ def test_failed_nuclei_run_does_not_advance_state():
     with mock.patch(
         "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=({"http/a.yaml"}, False)
     ), mock.patch(
-        "cybercover.modules.cybercover_nuclei.get_template_contents", return_value={"http/a.yaml": b"id: a\n"}
+        "cybercover.modules.cybercover_nuclei.get_template_contents",
+        return_value={"http/a.yaml": b"id: a\ninfo:\n  severity: high\n"}
     ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple", side_effect=failing_run), mock.patch(
         "artemis.modules.nuclei.check_output_log_on_error_with_stderr",
         side_effect=CalledProcessErrorWithMessage("boom", 1, ["nuclei"], b"", b"boom"),
@@ -510,21 +512,15 @@ def test_discovery_uses_latest_release_when_not_yet_installed(_ports_env):
         assert scanner._current_version() == "v10.6.0"
 
 
-def test_dast_scan_uses_release_dast_templates_as_absolute_paths_without_nt(tmp_path):
+def test_dast_scan_uses_filtered_release_templates_without_nt():
     from artemis.modules.nuclei import ScanUsing
 
-    root = tmp_path / "nuclei-templates"
-    (root / "dast").mkdir(parents=True)
-    (root / "dast/new.yaml").write_text("id: new")
-    (root / ".new-additions").write_text("http/a.yaml\ndast/new.yaml\ndast/gone.yaml\n")
     module = _module()
     module._incremental = True
-    module._use_native_nt = True
-    with mock.patch("cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(root) + "/"), mock.patch(
-        "artemis.modules.nuclei.Nuclei._scan", return_value=[]
-    ) as parent:
+    module._custom_template_paths = {"dast/new.yaml": "/tmp/dast/new.yaml"}
+    with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], use_fake_home=True, extra_nuclei_args=["-dast"])
-    assert parent.call_args.args[0] == [str(root / "dast/new.yaml")]
+    assert parent.call_args.args[0] == ["/tmp/dast/new.yaml"]
     assert "-nt" not in parent.call_args.kwargs["extra_nuclei_args"]
 
 
@@ -533,9 +529,267 @@ def test_dast_scan_without_any_templates_is_skipped(tmp_path):
 
     module = _module()
     module._incremental = True
-    module._use_native_nt = True
     with mock.patch("cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(tmp_path) + "/"), mock.patch(
         "artemis.modules.nuclei.Nuclei._scan", return_value=[]
     ) as parent:
         assert module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=["-dast"]) == []
     parent.assert_not_called()
+
+
+def _template(severity, extra="", tags=""):
+    return f"id: test\ninfo:\n  name: Test\n  severity: {severity}\n  tags: {tags or 'test'}\n{extra}".encode()
+
+
+def test_filter_keeps_only_high_and_critical_without_headless():
+    from cybercover.modules.cybercover_nuclei import filter_templates
+
+    contents = {
+        "http/high.yaml": _template("high"),
+        "dast/critical.yaml": _template("critical"),
+        "http/medium.yaml": _template("medium"),
+        "headless/high.yaml": _template("high"),
+        "http/mixed.yaml": _template("critical", "http: []\nheadless:\n  - steps: []\n"),
+        "http/info.yaml": _template("info"),
+    }
+    selected, _ = filter_templates(contents, {"high", "critical"})
+    assert set(selected) == {"http/high.yaml", "dast/critical.yaml"}
+
+
+def test_stricter_severity_threshold_is_respected():
+    from artemis.modules.runtime_configuration.nuclei_configuration import NucleiConfiguration, SeverityThreshold
+
+    module = _module()
+    module.get_runtime_configuration.return_value = NucleiConfiguration(
+        severity_threshold=SeverityThreshold.CRITICAL_ONLY
+    )
+    day = datetime.date(2026, 11, 5)
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=({"http/a.yaml", "http/b.yaml"}, False)
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_template_contents",
+        return_value={"http/a.yaml": _template("high"), "http/b.yaml": _template("critical")},
+    ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple") as scan:
+        scan.side_effect = lambda _: (
+            set(module._custom_template_paths) == {"http/b.yaml"}
+            or pytest.fail(f"unexpected paths: {module._custom_template_paths}")
+        )
+        module._run_group([_task("example.com")], "v10.5.1", day, "v10.5.1", day, set())
+    scan.assert_called_once()
+
+
+def test_lower_runtime_threshold_cannot_enable_medium():
+    from artemis.modules.runtime_configuration.nuclei_configuration import NucleiConfiguration, SeverityThreshold
+
+    module = _module()
+    module.get_runtime_configuration.return_value = NucleiConfiguration(severity_threshold=SeverityThreshold.ALL)
+    day = datetime.date(2026, 11, 5)
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=({"http/a.yaml"}, False)
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_template_contents",
+        return_value={"http/a.yaml": _template("medium")},
+    ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple") as scan:
+        module._run_group([_task("example.com")], "v10.5.1", day, "v10.5.1", day, set())
+    scan.assert_not_called()
+    assert _stored_version(module, "example.com:80") == "v10.5.1"
+
+
+@pytest.mark.parametrize("content", [b"info: [", b"info: {}", b"info: {severity: [high]}"])
+def test_invalid_metadata_is_an_error(content):
+    from cybercover.modules.cybercover_nuclei import filter_templates
+
+    with pytest.raises(TemplateLookupError):
+        filter_templates({"http/a.yaml": content}, {"high", "critical"})
+
+
+def test_all_filtered_templates_save_success_and_advance_state():
+    from artemis.binds import TaskStatus
+
+    module = _module()
+    task = _task("example.com")
+    day = datetime.date(2026, 11, 5)
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=({"http/a.yaml"}, False)
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_template_contents",
+        return_value={"http/a.yaml": _template("medium", "headless:\n  - steps: []\n")},
+    ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple") as scan:
+        module._run_group([task], "v10.5.1", day, "v10.5.1", day, {"http/a.yaml"})
+    scan.assert_not_called()
+    assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.OK
+    assert "No eligible" in module.save_task_result.call_args.kwargs["status_reason"]
+    assert _stored_version(module, "example.com:80") == "v10.5.1"
+
+
+def test_release_list_is_filtered_for_first_scan_and_release_transition(tmp_path):
+    root = tmp_path / "nuclei"
+    (root / "http").mkdir(parents=True)
+    (root / "dast").mkdir()
+    (root / "headless").mkdir()
+    (root / ".new-additions").write_text(
+        "http/high.yaml\nhttp/medium.yaml\ndast/critical.yaml\nheadless/high.yaml\n"
+    )
+    (root / "http/high.yaml").write_bytes(_template("high"))
+    (root / "http/medium.yaml").write_bytes(_template("medium"))
+    (root / "dast/critical.yaml").write_bytes(_template("critical"))
+    (root / "headless/high.yaml").write_bytes(_template("high"))
+    day = datetime.date(2026, 11, 5)
+    for last_version in (None, "v10.5.0"):
+        module = _module()
+        task = _task("example.com")
+        with mock.patch(
+            "cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(root) + "/"
+        ), mock.patch(
+            "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=({"http/high.yaml"}, True)
+        ), mock.patch(
+            "cybercover.modules.cybercover_nuclei.get_template_contents",
+            return_value={"http/high.yaml": _template("medium")},
+        ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple") as scan:
+            scan.side_effect = lambda _: (
+                set(module._custom_template_paths) == {"dast/critical.yaml"}
+                or pytest.fail(f"unexpected paths: {module._custom_template_paths}")
+            )
+            module._run_group([task], last_version, day, "v10.5.1", day, {"http/high.yaml"})
+        scan.assert_called_once()
+        assert _stored_version(module, "example.com:80") == "v10.5.1"
+
+
+def test_missing_release_list_and_bad_template_do_not_advance_state(tmp_path):
+    from artemis.binds import TaskStatus
+
+    day = datetime.date(2026, 11, 5)
+    for native, contents in ((True, {}), (False, {"http/a.yaml": b"info: ["})):
+        module = _module()
+        task = _task("example.com")
+        module.state.set_versions(["example.com:80"], "v10.5.0")
+        with mock.patch(
+            "cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(tmp_path) + "/"
+        ), mock.patch(
+            "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=(set(contents), native)
+        ), mock.patch("cybercover.modules.cybercover_nuclei.get_template_contents", return_value=contents):
+            module._run_group([task], "v10.5.0", day, "v10.5.1", day, set(contents))
+        assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.ERROR
+        assert _stored_version(module, "example.com:80") == "v10.5.0"
+
+
+def test_release_list_with_only_ineligible_templates_skips_nuclei(tmp_path):
+    from artemis.binds import TaskStatus
+
+    (tmp_path / "headless").mkdir()
+    (tmp_path / ".new-additions").write_text("headless/a.yaml\n")
+    (tmp_path / "headless/a.yaml").write_bytes(_template("critical", "headless: []\n"))
+    module = _module()
+    task = _task("example.com")
+    day = datetime.date(2026, 11, 5)
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(tmp_path) + "/"
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=(set(), True)
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_template_contents", return_value={}
+    ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple") as scan:
+        module._run_group([task], None, None, "v10.5.1", day, set())
+    scan.assert_not_called()
+    assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.OK
+    assert _stored_version(module, "example.com:80") == "v10.5.1"
+
+
+def test_router_excluded_tags_skip_empty_batch():
+    from artemis.modules.nuclei import ScanUsing
+
+    module = _module()
+    module._incremental = True
+    module._custom_template_paths = {"http/a.yaml": "/tmp/a.yaml"}
+    module._template_tags = {"http/a.yaml": {"wordpress", "cve"}}
+    with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
+        module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=["-etags", "wordpress"])
+    parent.assert_not_called()
+
+
+def test_failed_nuclei_run_saves_error_with_partial_findings():
+    from artemis.binds import TaskStatus
+    from cybercover.modules.cybercover_nuclei import CybercoverNuclei
+
+    module = _module()
+    del module.save_task_result
+    module._incremental = True
+    module._nuclei_failures = 1
+    task = _task("example.com")
+    with mock.patch("artemis.modules.nuclei.Nuclei.save_task_result") as save:
+        CybercoverNuclei.save_task_result(module, task, status=TaskStatus.INTERESTING, data=[{"id": "partial"}])
+    assert save.call_args.kwargs["status"] == TaskStatus.ERROR
+    assert save.call_args.kwargs["data"] == [{"id": "partial"}]
+
+
+def test_real_nuclei_runs_only_selected_templates(tmp_path, monkeypatch):
+    import shutil
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from artemis.modules.nuclei import ScanUsing
+    from cybercover.modules.cybercover_nuclei import filter_templates
+
+    if not shutil.which("nuclei"):
+        pytest.skip("Nuclei binary not available")
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"cybercover-test-match")
+
+        def log_message(self, format, *args):
+            pass
+
+    def nuclei_template(name, severity, extra=""):
+        return (
+            f"id: {name}\ninfo:\n  name: Test\n  author: test\n  severity: {severity}\n"
+            "http:\n  - method: GET\n    path:\n      - '{{BaseURL}}/'\n"
+            "    matchers:\n      - type: word\n        words:\n          - cybercover-test-match\n"
+            f"{extra}"
+        ).encode()
+
+    candidates = {
+        "http/high.yaml": nuclei_template("eligible-high", "high"),
+        "http/critical.yaml": nuclei_template("eligible-critical", "critical"),
+        "http/medium.yaml": nuclei_template("excluded-medium", "medium"),
+        "headless/high.yaml": nuclei_template("excluded-headless", "high", "headless: []\n"),
+    }
+    selected, tags = filter_templates(candidates, {"high", "critical"})
+    module = _module()
+    module._incremental = True
+    module._template_tags = tags
+    module.requests_per_second_for_current_tasks = 0
+    module._nuclei_templates_or_workflows_to_skip_probabilistically_set = set()
+    module._custom_template_paths = {}
+    for path, content in selected.items():
+        file = tmp_path / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(content)
+        module._custom_template_paths[path] = str(file)
+    home = tmp_path / "home"
+    home.mkdir()
+    config = home / ".config/nuclei"
+    config.mkdir(parents=True)
+    (config / "config.yaml").write_text(
+        "headless: true\nnew-templates: true\nnew-templates-version:\n  - v10.5.1\n"
+    )
+    installed = home / "nuclei-templates"
+    installed.mkdir()
+    (installed / ".new-additions").write_text("extra.yaml\n")
+    (installed / "extra.yaml").write_bytes(nuclei_template("excluded-native", "high"))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        findings = module._scan(
+            [], ScanUsing.TEMPLATES, [f"http://127.0.0.1:{server.server_port}"], extra_nuclei_args=[]
+        )
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+    assert {finding["template-id"] for finding in findings} == {"eligible-high", "eligible-critical"}

@@ -42,15 +42,25 @@ is not repeated on replay. If the state cannot be read, full discovery runs.
    from that target's last scan date. Only paths newly present in today's list are selected.
    If the old daily snapshot has expired or Redis lost it, the worker scans today's full list
    rather than risk skipping additions.
-4. For a first scan or a release transition, Nuclei is also run with its native `-nt` flag
-   (new templates of the installed release). Changes listed in today's `.new-additions` are fetched from GitHub `main`, cached per
-   file for 30 days, and passed to Nuclei as explicit template paths.
-5. After a successful scan (or a successful no-change result), it stores the installed release
-   and current scan time. Lookup or scan errors do not advance the state.
+4. For a first scan or a release transition, the worker also reads the installed release's
+   `.new-additions` list, the same source used by Nuclei's `-nt`. Changes listed in today's
+   `main/.new-additions` are fetched from GitHub and cached per file for 30 days. When a path
+   occurs in both lists, the downloaded `main` version takes precedence.
+5. Before starting Nuclei, the worker keeps only `high` and `critical` templates and excludes
+   any template in `headless/` or containing a `headless` section, including mixed-protocol
+   templates. A stricter Artemis severity threshold, such as `critical_only`, still applies;
+   a lower threshold cannot enable medium, low, info or unknown templates. Artemis' tag
+   exclusions also apply. The selected files are passed explicitly, without `-nt`, so the
+   release list cannot bypass these filters. This policy affects only the incremental module.
+6. If filtering leaves no templates, the worker records a successful no-eligible-templates
+   result without starting Nuclei. After a successful scan or no-eligible result, it stores the
+   installed release and current scan time. Lookup, invalid template metadata, missing release
+   files or scan errors do not advance the state. If any Nuclei run fails, the task is marked
+   as an error and any partial findings are retained.
 
 The cached custom YAML files are held in a temporary directory only for the duration of a scan;
-their contents are shared across customers through Redis. Nuclei release transitions are
-handled by native `-nt`; subsequent daily changes from `main` are scanned as custom templates.
+their contents are shared across customers through Redis. Installed-release templates are read
+from their original locations, while changes from `main` use temporary files.
 A full scan should still be scheduled separately every two weeks to catch anything missed by
 the best-effort daily incremental workflow.
 
