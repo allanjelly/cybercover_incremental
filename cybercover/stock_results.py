@@ -75,3 +75,31 @@ class StockPortResults:
                     continue
                 return as_utc(created_at), endpoints
         return None
+
+    def known_hosts(self, client: str, newer_than: datetime.datetime, limit: int) -> List[str]:
+        """Domains of ``client`` scanned by the stock port_scanner since ``newer_than`` (typically
+        the subdomains found by the monthly full scan), excluding the client itself, sorted.
+
+        Only DOMAIN tasks are returned: the IPs of a domain are found again by Artemis' IPLookup.
+        """
+        from artemis.db import TaskResult
+
+        since = as_utc(newer_than).replace(tzinfo=None)
+        statement = (
+            select(TaskResult.target_string, TaskResult.task)
+            .where(
+                TaskResult.receiver == STOCK_RECEIVER,
+                TaskResult.status.in_(COMPLETED_STATUSES),
+                TaskResult.created_at > since,
+                TaskResult.task["payload_persistent"]["original_target"].as_string() == client,
+            )
+        )
+        hosts = set()
+        with self._engine.connect() as connection:
+            for target, task in connection.execute(statement):
+                headers = (task or {}).get("headers", {}) if isinstance(task, dict) else {}
+                if headers.get("type") == "domain" and target and target != client:
+                    hosts.add(str(target).lower())
+        if len(hosts) > limit:
+            log.warning("Client %s has %d known hosts; replaying the first %d", client, len(hosts), limit)
+        return sorted(hosts)[:limit]

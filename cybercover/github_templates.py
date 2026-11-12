@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from pathlib import PurePosixPath
-from typing import Callable, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 import requests
@@ -24,6 +24,11 @@ log = logging.getLogger(__name__)
 
 CacheGet = Callable[[str], Optional[bytes]]
 CacheSet = Callable[..., None]
+# Stores a value only if the key is absent and returns the value that is stored afterwards (ours or
+# one written concurrently by another worker), e.g. Redis SET NX followed by GET.
+CacheAdd = Callable[..., bytes]
+
+MAX_RELEASE_PAGES = 10
 
 
 class TemplateLookupError(Exception):
@@ -114,8 +119,14 @@ def get_daily_additions(
     cache_get: CacheGet,
     cache_set: CacheSet,
     session: Optional[requests.Session] = None,
+    cache_add: Optional[CacheAdd] = None,
 ) -> Set[str]:
-    """Return one stable snapshot of main/.new-additions per UTC date and installed release."""
+    """Return one stable snapshot of main/.new-additions per UTC date and installed release.
+
+    With ``cache_add`` the snapshot is stored only if no other worker stored one for the same day
+    first, and the stored snapshot is returned: every worker scans with the list that the next day's
+    diff will use, even if main changed between their fetches.
+    """
     key = f"cybercover:additions:{day.isoformat()}:{version}"
     cached = cache_get(key)
     if cached is not None:
@@ -126,8 +137,11 @@ def get_daily_additions(
     if not isinstance(content, bytes):
         raise TemplateLookupError("Unexpected response for nuclei-templates .new-additions")
     additions = _parse_additions(content)
-    _cache_set(cache_set, key, json.dumps(sorted(additions)).encode("utf-8"))
-    return additions
+    value = json.dumps(sorted(additions)).encode("utf-8")
+    if cache_add is None:
+        _cache_set(cache_set, key, value)
+        return additions
+    return set(json.loads(cache_add(key, value, timeout=CACHE_TTL)))
 
 
 def get_cached_additions(day: datetime.date, version: str, cache_get: CacheGet) -> Optional[Set[str]]:
@@ -162,6 +176,96 @@ def templates_to_scan(
         # If Redis lost an older daily snapshot, rescan today's list rather than risk a gap.
         return set(today_additions), False
     return set(today_additions) - previous_additions, False
+
+
+def releases_between(
+    older: str,
+    newer: str,
+    cache_get: CacheGet,
+    cache_set: CacheSet,
+    session: Optional[requests.Session] = None,
+) -> List[str]:
+    """Release tags strictly between ``older`` and ``newer``, oldest first.
+
+    Each nuclei-templates release lists in its ``.new-additions`` only what was added since the
+    previous release, so a jump over several releases needs the lists of the releases in between.
+    """
+    try:
+        low, high = parse_version(older), parse_version(newer)
+    except ValueError as exc:
+        raise TemplateLookupError(str(exc)) from exc
+    if high <= low:
+        return []
+    day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    key = f"cybercover:releases:{day}:{older}"
+    cached = cache_get(key)
+    if cached is not None:
+        tags = json.loads(cached)
+    else:
+        session = session or requests.Session()
+        tags = []
+        reached = False
+        for page in range(1, MAX_RELEASE_PAGES + 1):
+            data = _request(session, f"{API}/repos/{REPO}/releases", params={"per_page": 100, "page": page})
+            if not isinstance(data, list):
+                raise TemplateLookupError("Unexpected GitHub releases response")
+            if not data:
+                reached = True  # no older releases exist
+                break
+            versions = []
+            for release in data:
+                tag = release.get("tag_name") if isinstance(release, dict) else None
+                try:
+                    versions.append(parse_version(tag))
+                except ValueError:
+                    continue
+                if not release.get("draft"):
+                    tags.append(tag)
+            if versions and min(versions) <= low:
+                reached = True
+                break
+        if not reached:
+            raise TemplateLookupError(f"Unable to list nuclei-templates releases back to {older}")
+        _cache_set(cache_set, key, json.dumps(tags).encode("utf-8"), RELEASE_CHECK_TTL)
+    between = {tag for tag in tags if low < parse_version(tag) < high}
+    return sorted(between, key=parse_version)
+
+
+def release_additions(
+    tag: str,
+    cache_get: CacheGet,
+    cache_set: CacheSet,
+    session: Optional[requests.Session] = None,
+) -> Set[str]:
+    """The ``.new-additions`` list of a published release (what it added since the previous one)."""
+    key = f"cybercover:release-additions:{tag}"
+    cached = cache_get(key)
+    if cached is not None:
+        return set(json.loads(cached))
+    session = session or requests.Session()
+    try:
+        content = _request(session, f"{RAW}/{quote(tag, safe='')}/.new-additions", raw=True)
+    except TemplateNotFoundError as exc:
+        raise TemplateLookupError(f"Release {tag} has no .new-additions list") from exc
+    if not isinstance(content, bytes):
+        raise TemplateLookupError(f"Unexpected response for .new-additions of {tag}")
+    additions = _parse_additions(content)
+    _cache_set(cache_set, key, json.dumps(sorted(additions)).encode("utf-8"))
+    return additions
+
+
+def intermediate_release_additions(
+    older: str,
+    newer: str,
+    cache_get: CacheGet,
+    cache_set: CacheSet,
+    session: Optional[requests.Session] = None,
+) -> Set[str]:
+    """Templates added by the releases strictly between ``older`` and ``newer``."""
+    paths: Set[str] = set()
+    for tag in releases_between(older, newer, cache_get, cache_set, session):
+        paths |= release_additions(tag, cache_get, cache_set, session)
+    return paths
 
 
 def latest_release(

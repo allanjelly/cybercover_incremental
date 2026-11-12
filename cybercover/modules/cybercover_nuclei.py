@@ -27,6 +27,7 @@ from cybercover.github_templates import (
     get_daily_additions,
     get_template_contents,
     installed_templates_version,
+    intermediate_release_additions,
     latest_release,
     parse_version,
     templates_to_scan,
@@ -143,6 +144,11 @@ class CybercoverNuclei(Nuclei):
     _state: Optional[ScanStateStore] = None
     _shared_templates_lock: Optional[ResourceLock] = None
     _nuclei_version: Optional[str] = None
+    # Tasks of the current batch whose result was saved without error. Artemis reruns run_multiple
+    # with the same batch when a task returned ERROR (SLOW_MODULE_NUM_RETRIES > 1); completed tasks
+    # are then skipped instead of being rescanned and overwritten (the result is upserted by task id).
+    _batch_uids: Optional[frozenset] = None
+    _completed_uids: Optional[Set[Any]] = None
 
     @property
     def lock(self) -> ResourceLock:
@@ -272,6 +278,46 @@ class CybercoverNuclei(Nuclei):
             status = TaskStatus.ERROR
             status_reason = f"{self._nuclei_failures} Nuclei runs failed; results may be incomplete"
         super().save_task_result(task=task, status=status, status_reason=status_reason, data=data)
+        if status != TaskStatus.ERROR and self._completed_uids is not None and task.uid in (self._batch_uids or ()):
+            self._completed_uids.add(task.uid)
+
+    def _cache_add(self, key: str, value: bytes, timeout: int) -> bytes:
+        """Store ``value`` unless another worker stored the key first; return the stored value."""
+        name = f"{self.cache.cache_name}:{key}"
+        if self.cache.redis.set(name, value, ex=timeout, nx=True):
+            return value
+        stored = self.cache.redis.get(name)
+        return stored if stored is not None else value
+
+    def _intermediate_release_additions(self, last_version: str, installed_version: str) -> Set[str]:
+        return intermediate_release_additions(last_version, installed_version, self.cache.get, self.cache.set)
+
+    def _release_contents(self, last_version: Optional[str], installed_version: str) -> Dict[str, bytes]:
+        """Templates added by the installed release and, after a jump over several releases, by the
+        releases in between - read from the shared templates volume.
+
+        The files are read under the template lock, so an update by nuclei-module (which removes and
+        reinstalls the templates) cannot make them disappear while they are read. Templates of an
+        intermediate release that are no longer installed were removed or moved upstream and are
+        skipped.
+        """
+        intermediate = self._intermediate_release_additions(last_version, installed_version) if last_version else set()
+        with self.lock:
+            contents, _missing = release_template_contents(NUCLEI_TEMPLATES_LOCATION)
+            for path in sorted(intermediate - set(contents)):
+                try:
+                    contents[path] = (Path(NUCLEI_TEMPLATES_LOCATION) / path).read_bytes()
+                except OSError:
+                    self.log.info("Skipping template of an intermediate release that is no longer installed: %s", path)
+                    TEMPLATES_SKIPPED.labels(reason="removed_since_release").inc()
+        if intermediate:
+            self.log.info(
+                "Release jump %s -> %s: %d templates added by the releases in between",
+                last_version,
+                installed_version,
+                len(intermediate),
+            )
+        return contents
 
     def _fail(self, tasks: List[Task], reason: str) -> None:
         self.log.error("Skipping tasks: %s", reason)
@@ -320,6 +366,17 @@ class CybercoverNuclei(Nuclei):
         if not tasks:
             return
 
+        batch = frozenset(task.uid for task in tasks)
+        if batch != self._batch_uids or self._completed_uids is None:
+            self._batch_uids = batch
+            self._completed_uids = set()
+        elif self._completed_uids:
+            pending = [task for task in tasks if task.uid not in self._completed_uids]
+            self.log.info("Retry of a batch: skipping %d already completed tasks", len(tasks) - len(pending))
+            tasks = pending
+            if not tasks:
+                return
+
         try:
             installed_version = installed_templates_version()
             if not installed_version:
@@ -329,7 +386,9 @@ class CybercoverNuclei(Nuclei):
             # The snapshot date is fixed when the batch starts and stored with the result, so the
             # next scan diffs against the snapshot that was actually used (even past midnight).
             today = datetime.datetime.now(datetime.timezone.utc).date()
-            additions = get_daily_additions(today, installed_version, self.cache.get, self.cache.set)
+            additions = get_daily_additions(
+                today, installed_version, self.cache.get, self.cache.set, cache_add=self._cache_add
+            )
             stored = self.state.get_states(endpoint_key(task) for task in tasks)
         except (TemplateLookupError, SQLAlchemyError, OSError, subprocess.CalledProcessError, ValueError) as exc:
             self._fail(tasks, f"Unable to prepare incremental scan: {exc}")
@@ -361,7 +420,7 @@ class CybercoverNuclei(Nuclei):
             downloaded_count = len(contents)
             release_paths: Set[str] = set()
             if use_native_nt:
-                release_contents, _missing = release_template_contents(NUCLEI_TEMPLATES_LOCATION)
+                release_contents = self._release_contents(last_version, installed_version)
                 release_paths = set(release_contents) - set(contents)
                 release_contents.update(contents)
                 contents = release_contents

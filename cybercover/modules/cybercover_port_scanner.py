@@ -20,7 +20,7 @@ from cybercover.github_templates import (
     parse_version,
 )
 from cybercover.keys import client_key
-from cybercover.state import DiscoveryStore, as_utc
+from cybercover.state import DiscoveryStore, as_utc, unique_ports
 from cybercover.stock_results import StockPortResults
 
 Endpoint = Tuple[int, str, bool]
@@ -33,6 +33,14 @@ MAX_AGE = datetime.timedelta(days=float(os.environ.get("CYBERCOVER_PORT_DISCOVER
 SOURCE_CACHE = "replayed"  # Cybercover's own earlier discovery
 SOURCE_FULL_SCAN = "full_scan"  # adopted from a stock port_scanner result (e.g. the monthly full scan)
 REPLAY_STATUS_REASON = "Replayed {count} stored endpoints without port scanning (source: {source})"
+
+# Subdomain enumeration does not run in an incremental scan (enabled_modules disables it). The hosts
+# of a client found by its last full scan are therefore replayed as DOMAIN tasks, once per analysis.
+KNOWN_HOSTS_MAX_AGE = datetime.timedelta(
+    days=float(os.environ.get("CYBERCOVER_FULL_SCAN_HOSTS_MAX_AGE_DAYS", "40"))
+)
+KNOWN_HOSTS_LIMIT = int(os.environ.get("CYBERCOVER_FULL_SCAN_HOSTS_LIMIT", "500"))
+KNOWN_HOSTS_EMITTED_TTL = 7 * 24 * 60 * 60
 
 
 @load_risk_class.load_risk_class(load_risk_class.LoadRiskClass.MEDIUM)
@@ -125,18 +133,50 @@ class CybercoverPortScanner(PortScanner):
         adopted = self.stock_results.latest(client, host, newer_than)
         if adopted is not None:
             scanned_at, endpoints = adopted
-            self.store.replace(client, host, version, endpoints, discovered_at=scanned_at)
-            self.log.info(
-                "Adopted %d endpoints of %s from the stock port_scanner result of %s",
-                len(endpoints),
-                host,
-                scanned_at.isoformat(),
-            )
-            return SOURCE_FULL_SCAN, sorted(set(endpoints))
+            # An empty result (host down or filtered during that scan) is not adopted: replaying it
+            # would skip Nuclei on the host for the whole age limit. Discover instead.
+            if endpoints:
+                self.store.replace(client, host, version, endpoints, discovered_at=scanned_at)
+                self.log.info(
+                    "Adopted %d endpoints of %s from the stock port_scanner result of %s",
+                    len(endpoints),
+                    host,
+                    scanned_at.isoformat(),
+                )
+                return SOURCE_FULL_SCAN, unique_ports(endpoints)
 
         if stored and stored[0] == version and now - stored[1] < MAX_AGE:
-            return SOURCE_CACHE, self.store.get_endpoints(client, host)
+            endpoints = self.store.get_endpoints(client, host)
+            # Likewise, an empty stored discovery is never replayed: discovery runs again.
+            if endpoints:
+                return SOURCE_CACHE, endpoints
         return "discover", []
+
+    def _replay_known_hosts(self, tasks: List[Task], now: datetime.datetime) -> None:
+        """Add DOMAIN tasks for the client's hosts known from its last full scan (e.g. subdomains),
+        once per analysis and client. They are then handled like the requested target: adopted,
+        replayed or discovered, and scanned by Nuclei."""
+        for task in tasks:
+            if task.headers.get("type") != TaskType.DOMAIN:
+                continue
+            client = client_key(task)
+            marker = f"{self.cache.cache_name}:known-hosts:{task.root_uid}:{client}"
+            if not self.cache.redis.set(marker, b"1", ex=KNOWN_HOSTS_EMITTED_TTL, nx=True):
+                continue  # already done for this analysis (including for the emitted hosts themselves)
+            try:
+                hosts = self.stock_results.known_hosts(client, now - KNOWN_HOSTS_MAX_AGE, KNOWN_HOSTS_LIMIT)
+            except SQLAlchemyError:
+                self.log.exception("Unable to read the known hosts of %s; scanning only the requested target", client)
+                continue
+            current = get_target_host(task)
+            added = 0
+            for host in hosts:
+                if host in (current, client):
+                    continue
+                if self.add_task_if_domain_exists(task, Task({"type": TaskType.DOMAIN}, payload={"domain": host})):
+                    added += 1
+            if hosts:
+                self.log.info("Replaying %d of %d hosts of %s known from the last full scan", added, len(hosts), client)
 
     def run_multiple(self, tasks: List[Task]) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -158,6 +198,10 @@ class CybercoverPortScanner(PortScanner):
 
         for task, endpoints, source in to_replay:
             self._replay(task, endpoints, source)
+        try:
+            self._replay_known_hosts(tasks, now)
+        except Exception:  # never fail the port scan because of the extra hosts
+            self.log.exception("Unable to replay the known hosts of the batch")
         self.log.info(
             "%d targets replayed (%d from the stock port scanner), %d need discovery",
             len(to_replay),
@@ -172,12 +216,13 @@ class CybercoverPortScanner(PortScanner):
                 captured = self._capture
             finally:
                 self._capture = None
-            try:
-                for task in to_discover:
-                    key = (client_key(task), get_target_host(task))
+            for task in to_discover:
+                key = (client_key(task), get_target_host(task))
+                try:
+                    # Each host separately, so one failure does not lose the other hosts of the batch.
                     self.store.replace(key[0], key[1], version, captured.get(key, []), discovered_at=as_utc(now))
-            except SQLAlchemyError:
-                self.log.exception("Unable to store discovered endpoints; discovery will repeat next time")
+                except SQLAlchemyError:
+                    self.log.exception("Unable to store endpoints of %s; discovery will repeat next time", key[1])
 
 
 if __name__ == "__main__":

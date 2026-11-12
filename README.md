@@ -41,12 +41,30 @@ For every (client, host), in this order:
 3. **Discover.** Otherwise the stock scanner runs (naabu + fingerprintx). The resulting SERVICE
    endpoints replace the stored list. If the scan fails nothing is stored, so discovery repeats.
 
+An **empty** port list (the host was down or filtered during that scan) is never replayed or adopted:
+the next incremental scan runs discovery again, so a host with no open ports costs one quick port scan
+per day instead of being skipped for the whole age limit. One endpoint is kept per port: when the IPs
+of a domain expose the same port with different fingerprints, the TLS variant is kept. Each host's
+endpoints are stored separately, so a failure for one host does not affect the others.
+
+**Hosts from the full scan (subdomains).** With `enabled_modules`, Artemis disables subdomain
+enumeration, so an incremental scan would only reach the requested targets. Once per analysis and
+client, the module therefore adds a DOMAIN task for every domain of the client that the stock
+`port_scanner` scanned in the last `CYBERCOVER_FULL_SCAN_HOSTS_MAX_AGE_DAYS` (default 40) - in
+practice the subdomains found by the last monthly full scan, at most `CYBERCOVER_FULL_SCAN_HOSTS_LIMIT`
+(default 500). Like Artemis' subdomain enumeration it skips domains that no longer resolve or show a
+placeholder page. These hosts then go through adopt, replay or discover like the requested target,
+and `cybercover_nuclei` scans them. Subdomains that appeared after the full scan are found by the
+next full scan. The full scan's results must still exist, so raise Artemis' archiver age (see
+Deployment).
+
 Replayed and adopted endpoints are emitted as the same SERVICE tasks, so `nuclei-router` and
 `cybercover_nuclei` run as usual. The task result is `OK` with
 `{host: {port: {"service", "ssl", "source"}}}`, where `source` is `replayed` (own earlier discovery)
 or `full_scan` (adopted); reporters must not present these as new findings. A newly discovered result
 has the stock format and status. A port opened since the last discovery is found within the age
-limit at the latest. If GitHub is unreachable, the last release seen in the past 30 days is used, so
+limit at the latest; the stock scanner caches port results per IP for 24 hours, so stored or adopted
+ports can be up to a day older than their timestamp. If GitHub is unreachable, the last release seen in the past 30 days is used, so
 the version does not flip back to the installed release. If the state cannot be read, full discovery
 runs. A DNS lookup is not repeated on replay.
 
@@ -57,16 +75,25 @@ runs. A DNS lookup is not repeated on replay.
    as Artemis' `nuclei-module` (both update the shared templates volume) and skips the update if the
    other module installed the release meanwhile. The installed release is verified before proceeding.
 2. It fetches `main/.new-additions` once per UTC day and installed release. The snapshot is
-   cached in Artemis Redis for 30 days. The snapshot date is fixed when a batch starts.
+   cached in Artemis Redis for 30 days. The snapshot date is fixed when a batch starts. Only the
+   first worker's snapshot of a day is stored (Redis `SET NX`); other workers use that one, so all
+   scans of a day use the list the next day's diff starts from.
 3. For an existing customer endpoint on the same release, it compares today's list with the
    snapshot used by that endpoint's last successful scan (stored with the state, so a scan running
    past midnight UTC does not skip later additions). Only paths newly present are selected.
    If the old snapshot has expired or Redis lost it, the worker scans today's full list
    rather than risk skipping additions.
 4. For a first scan or a release transition, the worker also reads the installed release's
-   `.new-additions` list, the same source used by Nuclei's `-nt`. Templates listed in today's
-   `main/.new-additions` are fetched from GitHub and cached per file for 30 days. When a path
-   occurs in both lists, the downloaded `main` version takes precedence.
+   `.new-additions` list, the same source used by Nuclei's `-nt`. A release's list contains only
+   what was added since the previous release, so when an endpoint's last scan was more than one
+   release ago (e.g. v10.5.0 -> v10.5.2), the lists of the releases in between are added too (release
+   list from the GitHub API, each release's `.new-additions` from GitHub, cached); their templates
+   are read from the installed templates, and ones removed upstream since are skipped. If the
+   releases in between cannot be determined, the state is not advanced. Release templates are read
+   under the template lock shared with `nuclei-module`, so a template update cannot remove them
+   while they are read. Templates listed in today's `main/.new-additions` are fetched from GitHub
+   and cached per file for 30 days. When a path occurs in both lists, the downloaded `main` version
+   takes precedence.
 5. Before starting Nuclei, the worker keeps only `high` and `critical` templates and excludes
    any template in `headless/` or containing a `headless` section, including mixed-protocol
    templates. A stricter Artemis severity threshold, such as `critical_only`, still applies;
@@ -82,7 +109,9 @@ runs. A DNS lookup is not repeated on replay.
    result without starting Nuclei. After a successful scan or no-eligible result, it stores the
    installed release and the snapshot date. A failed GitHub lookup, a missing release
    `.new-additions` file, or a failed Nuclei run does not advance the state; if any Nuclei run
-   fails, the task is marked as an error and any partial findings are retained.
+   fails, the task is marked as an error and any partial findings are retained. When Artemis retries
+   a batch because a task returned an error (`SLOW_MODULE_NUM_RETRIES` above 1), tasks already
+   completed in the first try are not scanned or saved again.
 8. Findings from templates downloaded from `main` carry the template's repository path in
    `template` (as for installed templates), not the temporary file path. Homepage links are crawled
    only if a selected template is on Artemis' homepage-links template list.
@@ -92,7 +121,9 @@ their contents are shared across customers through Redis. Installed-release temp
 from their original locations, while templates from `main` use temporary files.
 
 **Limits.** `.new-additions` lists only *new* templates: templates modified in `main` (e.g. improved
-matchers) are not rescanned until the next full scan, which must still run monthly. A template
+matchers) are not rescanned until the next full scan, which must still run monthly. Scan state is
+kept per (client, host, port), not per scheme: a second HTTP/HTTPS target on the same port in a later
+batch of the same day counts as already scanned. A template
 skipped as invalid is not retried incrementally either. No restart of the worker is needed when a
 release is published: it updates the templates itself before the next batch.
 
@@ -121,6 +152,12 @@ SQLAlchemy metadata, outside Artemis' Alembic migrations:
 3. Optional: `CYBERCOVER_GITHUB_TOKEN` (a read-only token) raises GitHub API rate limits.
 4. Optional: `CYBERCOVER_PORT_DISCOVERY_MAX_AGE_DAYS` (default `7`) - how old stored ports may be
    before they are rediscovered.
+5. Set Artemis' archiver age for non-interesting results above the full-scan interval, e.g. 40 days:
+   `AUTOARCHIVER_MIN_AGE_SECONDS_NOT_INTERESTING=3456000`. Artemis' default (15 days) removes the full
+   scan's port results, which the incremental scan uses to find the client's subdomains, and the
+   module errors the reports service uses for completeness. Optional:
+   `CYBERCOVER_FULL_SCAN_HOSTS_MAX_AGE_DAYS` (default `40`; keep it at or below the archiver age) and
+   `CYBERCOVER_FULL_SCAN_HOSTS_LIMIT` (default `500`).
 
 The Nuclei HTML reporter ignores results from this module (it accepts only `nuclei` and
 `nuclei-module`), but `/api/task-results?only_interesting=false` returns them.

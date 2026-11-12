@@ -83,6 +83,19 @@ def _create_engine(conn_str: Optional[str], engine: Optional[Engine]) -> Engine:
     return engine
 
 
+def unique_ports(endpoints: Iterable[Tuple[int, str, bool]]) -> List[Tuple[int, str, bool]]:
+    """One endpoint per port, sorted by port.
+
+    A domain with several IPs can expose the same port with different fingerprints (service or
+    TLS). Endpoints are stored per (client, host, port), so one is kept deterministically: the TLS
+    variant first, then the alphabetically first service.
+    """
+    chosen: Dict[int, Tuple[int, str, bool]] = {}
+    for port, service, ssl in sorted(set(endpoints), key=lambda e: (e[0], not e[2], e[1])):
+        chosen.setdefault(int(port), (int(port), service, bool(ssl)))
+    return [chosen[port] for port in sorted(chosen)]
+
+
 class DiscoveryStore:
     def __init__(self, conn_str: Optional[str] = None, engine: Optional[Engine] = None) -> None:
         self.engine = _create_engine(conn_str, engine)
@@ -127,7 +140,7 @@ class DiscoveryStore:
             session.query(DiscoveredEndpoint).filter(
                 DiscoveredEndpoint.client == client, DiscoveredEndpoint.host == host
             ).delete()
-            for port, service, ssl in set(endpoints):
+            for port, service, ssl in unique_ports(endpoints):
                 session.add(DiscoveredEndpoint(client=client, host=host, port=port, service=service, ssl=ssl))
             session.merge(DiscoveryState(client=client, host=host, templates_version=version, discovered_at=when))
             session.commit()

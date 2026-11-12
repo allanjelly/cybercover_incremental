@@ -197,6 +197,8 @@ def _module():
     module._template_tags = {}
     module._severity_levels = ["critical", "high"]
     module.get_runtime_configuration = mock.Mock(return_value=NucleiConfiguration())
+    # No release jump unless a test says so (the real lookup asks GitHub for the releases in between).
+    module._intermediate_release_additions = mock.Mock(return_value=set())
     return module
 
 
@@ -432,6 +434,7 @@ def _port_scanner():
     scanner._store = DiscoveryStore(engine=create_engine("sqlite://"))
     scanner._stock_results = mock.Mock()
     scanner._stock_results.latest.return_value = None
+    scanner._stock_results.known_hosts.return_value = []
     scanner._capture = None
     scanner.cache = mock.Mock()
     scanner.save_task_result = mock.Mock()
