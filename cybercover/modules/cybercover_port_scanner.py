@@ -165,18 +165,32 @@ class CybercoverPortScanner(PortScanner):
                 continue  # already done for this analysis (including for the emitted hosts themselves)
             try:
                 hosts = self.stock_results.known_hosts(client, now - KNOWN_HOSTS_MAX_AGE, KNOWN_HOSTS_LIMIT)
-            except SQLAlchemyError:
+            except Exception:  # noqa: BLE001
                 self.log.exception("Unable to read the known hosts of %s; scanning only the requested target", client)
+                self.cache.redis.delete(marker)  # a retry of the task tries again
                 continue
             current = get_target_host(task)
-            added = 0
+            added = failed = 0
             for host in hosts:
                 if host in (current, client):
                     continue
-                if self.add_task_if_domain_exists(task, Task({"type": TaskType.DOMAIN}, payload={"domain": host})):
-                    added += 1
+                try:
+                    if self.add_task_if_domain_exists(task, Task({"type": TaskType.DOMAIN}, payload={"domain": host})):
+                        added += 1
+                except Exception:  # noqa: BLE001 - one host must not stop the others
+                    failed += 1
+                    self.log.exception("Unable to add known host %s of %s", host, client)
+            if failed:
+                # A retry of the task adds the hosts again; Artemis drops the ones already added.
+                self.cache.redis.delete(marker)
             if hosts:
-                self.log.info("Replaying %d of %d hosts of %s known from the last full scan", added, len(hosts), client)
+                self.log.info(
+                    "Replaying %d of %d hosts of %s known from the last full scan (%d failed)",
+                    added,
+                    len(hosts),
+                    client,
+                    failed,
+                )
 
     def run_multiple(self, tasks: List[Task]) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -193,6 +207,10 @@ class CybercoverPortScanner(PortScanner):
         except (TemplateLookupError, SQLAlchemyError, ValueError, OSError) as exc:
             # Fall back to full discovery rather than skipping the scan.
             self.log.error("Unable to read discovery state (%s); running full port discovery", exc)
+            try:
+                self._replay_known_hosts(tasks, now)
+            except Exception:  # noqa: BLE001
+                self.log.exception("Unable to replay the known hosts of the batch")
             super().run_multiple(tasks)
             return
 

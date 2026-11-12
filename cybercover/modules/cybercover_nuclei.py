@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
+import timeout_decorator
 import yaml
 from karton.core import Task
 from prometheus_client import Counter, start_http_server
@@ -274,6 +275,12 @@ class CybercoverNuclei(Nuclei):
     def save_task_result(
         self, task: Task, *, status: TaskStatus, status_reason: Optional[str] = None, data: Optional[Any] = None
     ) -> None:
+        if status == TaskStatus.ERROR and self._completed_uids and task.uid in self._completed_uids:
+            # Artemis saves ERROR for every task of a batch when run_multiple raises (e.g. a timeout
+            # in a later state group). A task completed earlier in the batch keeps its result: its
+            # state was already advanced, so overwriting it would lose its findings.
+            self.log.warning("Keeping the completed result of task %s despite an error in its batch", task.uid)
+            return
         if self._incremental and self._nuclei_failures:
             status = TaskStatus.ERROR
             status_reason = f"{self._nuclei_failures} Nuclei runs failed; results may be incomplete"
@@ -290,7 +297,12 @@ class CybercoverNuclei(Nuclei):
         return stored if stored is not None else value
 
     def _intermediate_release_additions(self, last_version: str, installed_version: str) -> Set[str]:
-        return intermediate_release_additions(last_version, installed_version, self.cache.get, self.cache.set)
+        def missing_list(tag: str) -> None:
+            TEMPLATES_SKIPPED.labels(reason="release_without_list").inc()
+
+        return intermediate_release_additions(
+            last_version, installed_version, self.cache.get, self.cache.set, on_missing_list=missing_list
+        )
 
     def _release_contents(self, last_version: Optional[str], installed_version: str) -> Dict[str, bytes]:
         """Templates added by the installed release and, after a jump over several releases, by the
@@ -401,7 +413,14 @@ class CybercoverNuclei(Nuclei):
             groups.setdefault(group_key, []).append(task)
 
         for (last_version, last_snapshot_date), group in groups.items():
-            self._run_group(group, last_version, last_snapshot_date, installed_version, today, additions)
+            try:
+                self._run_group(group, last_version, last_snapshot_date, installed_version, today, additions)
+            except timeout_decorator.TimeoutError:
+                raise  # the module's time is up; Artemis handles it (completed tasks keep their results)
+            except Exception as exc:  # noqa: BLE001 - one failing group must not affect the others
+                self.log.exception("Incremental scan of a group of %d targets failed", len(group))
+                failed = [task for task in group if task.uid not in (self._completed_uids or set())]
+                self._fail(failed, f"Incremental scan failed: {type(exc).__name__}: {exc}")
 
     def _run_group(
         self,

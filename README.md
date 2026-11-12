@@ -54,7 +54,9 @@ client, the module therefore adds a DOMAIN task for every domain of the client t
 practice the subdomains found by the last monthly full scan, at most `CYBERCOVER_FULL_SCAN_HOSTS_LIMIT`
 (default 500). Like Artemis' subdomain enumeration it skips domains that no longer resolve or show a
 placeholder page. These hosts then go through adopt, replay or discover like the requested target,
-and `cybercover_nuclei` scans them. Subdomains that appeared after the full scan are found by the
+and `cybercover_nuclei` scans them. If the host lookup or adding a host fails, the other hosts are
+still added and a retry of the task tries again; this also happens when the module falls back to
+plain discovery. Subdomains that appeared after the full scan are found by the
 next full scan. The full scan's results must still exist, so raise Artemis' archiver age (see
 Deployment).
 
@@ -89,7 +91,12 @@ runs. A DNS lookup is not repeated on replay.
    release ago (e.g. v10.5.0 -> v10.5.2), the lists of the releases in between are added too (release
    list from the GitHub API, each release's `.new-additions` from GitHub, cached); their templates
    are read from the installed templates, and ones removed upstream since are skipped. If the
-   releases in between cannot be determined, the state is not advanced. Release templates are read
+   releases in between cannot be determined (e.g. GitHub unreachable), the state is not advanced.
+   A release that has no `.new-additions` file at all (GitHub answers 404; a release without new
+   templates has an empty file) is skipped with a warning and counted as `release_without_list` in
+   `cybercover_templates_skipped_total`, so it cannot block the endpoints scanned before it; its
+   templates wait for the next full scan. A release list cached earlier the same day is fetched again
+   if it does not reach the installed release. Release templates are read
    under the template lock shared with `nuclei-module`, so a template update cannot remove them
    while they are read. Templates listed in today's `main/.new-additions` are fetched from GitHub
    and cached per file for 30 days. When a path occurs in both lists, the downloaded `main` version
@@ -111,7 +118,9 @@ runs. A DNS lookup is not repeated on replay.
    `.new-additions` file, or a failed Nuclei run does not advance the state; if any Nuclei run
    fails, the task is marked as an error and any partial findings are retained. When Artemis retries
    a batch because a task returned an error (`SLOW_MODULE_NUM_RETRIES` above 1), tasks already
-   completed in the first try are not scanned or saved again.
+   completed in the first try are not scanned or saved again. An unexpected exception in one group of
+   endpoints of a batch fails only that group; and when Artemis marks a whole batch as failed (e.g. a
+   timeout), tasks completed earlier in the batch keep their results.
 8. Findings from templates downloaded from `main` carry the template's repository path in
    `template` (as for installed templates), not the temporary file path. Homepage links are crawled
    only if a selected template is on Artemis' homepage-links template list.

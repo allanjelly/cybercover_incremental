@@ -199,9 +199,10 @@ def releases_between(
     day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
     key = f"cybercover:releases:{day}:{older}"
     cached = cache_get(key)
-    if cached is not None:
-        tags = json.loads(cached)
-    else:
+    tags = json.loads(cached) if cached is not None else None
+    # A list cached earlier today may predate releases published since; refetch if it does not
+    # reach the newer release.
+    if tags is None or not any(parse_version(tag) >= high for tag in tags):
         session = session or requests.Session()
         tags = []
         reached = False
@@ -236,17 +237,24 @@ def release_additions(
     cache_get: CacheGet,
     cache_set: CacheSet,
     session: Optional[requests.Session] = None,
-) -> Set[str]:
-    """The ``.new-additions`` list of a published release (what it added since the previous one)."""
+) -> Optional[Set[str]]:
+    """The ``.new-additions`` list of a published release (what it added since the previous one).
+
+    None if the release has no such file (GitHub answers 404). A release without new templates has an
+    empty file, so a missing file is abnormal upstream and its additions are unknown. Other errors
+    (GitHub unreachable) raise TemplateLookupError.
+    """
     key = f"cybercover:release-additions:{tag}"
     cached = cache_get(key)
     if cached is not None:
-        return set(json.loads(cached))
+        value = json.loads(cached)
+        return None if value is None else set(value)
     session = session or requests.Session()
     try:
         content = _request(session, f"{RAW}/{quote(tag, safe='')}/.new-additions", raw=True)
-    except TemplateNotFoundError as exc:
-        raise TemplateLookupError(f"Release {tag} has no .new-additions list") from exc
+    except TemplateNotFoundError:
+        _cache_set(cache_set, key, b"null")
+        return None
     if not isinstance(content, bytes):
         raise TemplateLookupError(f"Unexpected response for .new-additions of {tag}")
     additions = _parse_additions(content)
@@ -260,11 +268,23 @@ def intermediate_release_additions(
     cache_get: CacheGet,
     cache_set: CacheSet,
     session: Optional[requests.Session] = None,
+    on_missing_list: Optional[Callable[[str], None]] = None,
 ) -> Set[str]:
-    """Templates added by the releases strictly between ``older`` and ``newer``."""
+    """Templates added by the releases strictly between ``older`` and ``newer``.
+
+    A release without a ``.new-additions`` file is skipped with a warning (and ``on_missing_list``),
+    so it cannot block the endpoints scanned before it forever; its additions wait for the next full
+    scan.
+    """
     paths: Set[str] = set()
     for tag in releases_between(older, newer, cache_get, cache_set, session):
-        paths |= release_additions(tag, cache_get, cache_set, session)
+        additions = release_additions(tag, cache_get, cache_set, session)
+        if additions is None:
+            log.warning("Release %s has no .new-additions list; its new templates wait for the next full scan", tag)
+            if on_missing_list:
+                on_missing_list(tag)
+            continue
+        paths |= additions
     return paths
 
 

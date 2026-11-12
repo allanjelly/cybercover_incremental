@@ -90,8 +90,30 @@ def test_intermediate_release_additions_are_combined():
     assert paths == {"http/b.yaml", "http/c.yaml", "http/d.yaml"}
 
 
-def test_missing_list_of_an_intermediate_release_raises():
-    session = Pages([_releases("v10.5.2", "v10.5.1", "v10.5.0")], {})
+def test_intermediate_release_without_a_list_is_skipped():
+    """Second review N3 (decision a): a release without .new-additions (404) is skipped and counted,
+    so it cannot block the endpoints scanned before it forever."""
+    session = Pages(
+        [_releases("v10.5.3", "v10.5.2", "v10.5.1", "v10.5.0")], {"v10.5.2": b"http/c.yaml\n"}
+    )
+    missing = []
+    paths = intermediate_release_additions(
+        "v10.5.0", "v10.5.3", lambda _: None, lambda *a, **k: None, session, on_missing_list=missing.append
+    )
+    assert paths == {"http/c.yaml"}
+    assert missing == ["v10.5.1"]
+
+
+def test_unreachable_github_for_an_intermediate_list_still_raises():
+    class Down(Pages):
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url.endswith("/.new-additions"):
+                import requests
+
+                raise requests.ConnectionError("down")
+            return super().get(url, params, headers, timeout)
+
+    session = Down([_releases("v10.5.2", "v10.5.1", "v10.5.0")])
     with pytest.raises(TemplateLookupError):
         intermediate_release_additions("v10.5.0", "v10.5.2", lambda _: None, lambda *a, **k: None, session)
 
@@ -401,3 +423,223 @@ def test_known_hosts_query_against_artemis_task_result_table(postgres_engine):  
     since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=40)
     assert lookup.known_hosts("client.pl", since, limit=10) == ["shop.client.pl", "www.client.pl"]
     assert lookup.known_hosts("client.pl", since, limit=1) == ["shop.client.pl"]
+
+
+# Second review (N1-N4) and its test gaps ------------------------------------------------------
+
+
+def _batch_module(today):
+    from artemis.binds import TaskType
+
+    module = _module()
+    del module.save_task_result  # the module's own save_task_result, as in production
+    task_a, task_b = _task("a.example.com"), _task("b.example.com")
+    for task in (task_a, task_b):
+        task.headers = {"type": TaskType.NUCLEI_TARGET}
+    _set_state(module, "a.example.com", "v10.5.1", snapshot_date=today - datetime.timedelta(days=1))
+    module.db = mock.Mock()
+    module.db.save_module_started_task.return_value = True
+    module.db.get_task_by_id.return_value = {"status": "INTERESTING"}
+    module._current_task_locks = {}
+    module.check_connection_to_base_url_and_save_error = lambda task: True
+    return module, task_a, task_b
+
+
+def _batch_patches(module, stock_run):
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    for target, kwargs in [
+        ("cybercover.modules.cybercover_nuclei.installed_templates_version", {"return_value": "v10.5.1"}),
+        ("cybercover.modules.cybercover_nuclei.get_daily_additions", {"return_value": {"http/a.yaml"}}),
+        ("cybercover.modules.cybercover_nuclei.get_template_contents",
+         {"side_effect": lambda paths, *a, **k: {p: _template("high") for p in paths}}),
+        ("cybercover.modules.cybercover_nuclei.release_template_contents", {"return_value": ({}, [])}),
+        ("artemis.modules.nuclei.Nuclei.run_multiple", {"side_effect": stock_run}),
+    ]:
+        stack.enter_context(mock.patch(target, **kwargs))
+    stack.enter_context(mock.patch.object(module, "_update_templates_if_needed", return_value="v10.5.1"))
+    stack.enter_context(mock.patch.object(module, "_log_nuclei_version"))
+    return stack
+
+
+def test_exception_in_a_later_group_does_not_overwrite_a_completed_group():
+    """Inverted second-review proof N1, through the real ArtemisBase.process_multiple."""
+    from artemis.binds import TaskStatus
+    from artemis.module_base import ArtemisBase
+
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    module, task_a, task_b = _batch_module(today)
+
+    def stock_run(tasks):
+        if task_b in tasks:
+            raise AssertionError("Cannot match finding: {...}")
+        for task in tasks:
+            module.save_task_result(task=task, status=TaskStatus.INTERESTING, data=[{"template-id": "new-cve"}])
+
+    with mock.patch("artemis.module_base.ArtemisBase.save_task_result") as saved, _batch_patches(module, stock_run):
+        ArtemisBase.process_multiple(module, [task_a, task_b])  # the failing group no longer escapes
+    by_task = {}
+    for call in saved.call_args_list:
+        by_task.setdefault(call.kwargs["task"], []).append(call.kwargs["status"])
+    assert by_task == {task_a: [TaskStatus.INTERESTING], task_b: [TaskStatus.ERROR]}
+    assert _stored(module, "a.example.com") == ("v10.5.1", today)
+    assert _stored(module, "b.example.com") is None
+
+
+def test_timeout_keeps_the_results_of_completed_tasks():
+    """A timeout still reaches Artemis, which saves ERROR for the whole batch; completed tasks keep
+    their results."""
+    import timeout_decorator
+
+    from artemis.binds import TaskStatus
+    from artemis.module_base import ArtemisBase
+
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    module, task_a, task_b = _batch_module(today)
+
+    def stock_run(tasks):
+        if task_b in tasks:
+            raise timeout_decorator.TimeoutError("Timed Out")
+        for task in tasks:
+            module.save_task_result(task=task, status=TaskStatus.INTERESTING, data=[{"template-id": "new-cve"}])
+
+    with mock.patch("artemis.module_base.ArtemisBase.save_task_result") as saved, _batch_patches(module, stock_run):
+        with pytest.raises(timeout_decorator.TimeoutError):
+            ArtemisBase.process_multiple(module, [task_a, task_b])
+    statuses_a = [c.kwargs["status"] for c in saved.call_args_list if c.kwargs["task"] is task_a]
+    statuses_b = [c.kwargs["status"] for c in saved.call_args_list if c.kwargs["task"] is task_b]
+    assert statuses_a == [TaskStatus.INTERESTING]
+    assert statuses_b == [TaskStatus.ERROR]
+
+
+def test_run_multiple_passes_the_set_nx_cache_to_the_daily_snapshot():
+    """Test gap 2: the F6 fix depends on run_multiple passing cache_add."""
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    module, task_a, _ = _batch_module(today)
+    with _batch_patches(module, lambda tasks: None), mock.patch(
+        "cybercover.modules.cybercover_nuclei.get_daily_additions", return_value=set()
+    ) as daily, mock.patch("artemis.module_base.ArtemisBase.save_task_result"):
+        module.run_multiple([task_a])
+    assert daily.call_args.kwargs["cache_add"] == module._cache_add
+
+
+def test_intermediate_release_lookup_uses_the_module_cache():
+    """Test gap 3: the bridge from the module to intermediate_release_additions."""
+    module = _module()
+    del module._intermediate_release_additions
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.intermediate_release_additions", return_value={"http/b.yaml"}
+    ) as lookup:
+        assert module._intermediate_release_additions("v10.5.0", "v10.5.2") == {"http/b.yaml"}
+    args, kwargs = lookup.call_args
+    assert args == ("v10.5.0", "v10.5.2", module.cache.get, module.cache.set)
+    kwargs["on_missing_list"]("v10.5.1")  # counted, does not raise
+
+
+def test_cached_release_list_is_refetched_when_it_does_not_reach_the_installed_release():
+    """Inverted second-review proof N4."""
+    cache = {}
+
+    def cache_set(key, value, timeout=None):
+        cache[key] = value
+
+    morning = Pages([_releases("v10.5.2", "v10.5.1", "v10.5.0")])
+    assert releases_between("v10.5.0", "v10.5.2", cache.get, cache_set, morning) == ["v10.5.1"]
+    evening = Pages([_releases("v10.5.4", "v10.5.3", "v10.5.2", "v10.5.1", "v10.5.0")])
+    assert releases_between("v10.5.0", "v10.5.4", cache.get, cache_set, evening) == ["v10.5.1", "v10.5.2", "v10.5.3"]
+    assert len(evening.calls) == 1
+    # a cached list that reaches the newer release is used as it is
+    assert releases_between("v10.5.0", "v10.5.3", cache.get, cache_set, Pages([])) == ["v10.5.1", "v10.5.2"]
+
+
+def test_releases_between_ignores_drafts_and_unparsable_tags():
+    """Test gap 6."""
+    page = [{"tag_name": "v10.5.3"}, {"tag_name": "v10.5.2", "draft": True}, {"tag_name": "nightly"},
+            {"tag_name": "v10.5.1"}, {"tag_name": "v10.5.0"}]
+    tags = releases_between("v10.5.0", "v10.5.3", lambda _: None, lambda *a, **k: None, Pages([page]))
+    assert tags == ["v10.5.1"]
+
+
+def _fake_redis(scanner):
+    store = {}
+    scanner.cache.cache_name = "cache.cybercover_port_scanner"
+
+    def redis_set(key, value, ex=None, nx=False):
+        if nx and key in store:
+            return None
+        store[key] = value
+        return True
+
+    scanner.cache.redis.set.side_effect = redis_set
+    scanner.cache.redis.delete.side_effect = lambda key: store.pop(key, None)
+    return store
+
+
+def test_known_hosts_are_added_again_after_a_failure(_ports_env):  # noqa: F811
+    """Inverted second-review proof N2a: a failed host does not lose the others, and a retry of the
+    task adds the hosts again."""
+    scanner = _port_scanner()
+    _fake_redis(scanner)
+    scanner._store.replace("client.pl", "client.pl", "v10.5.0", [(443, "http", True)])
+    scanner._stock_results.known_hosts.return_value = ["a.client.pl", "b.client.pl", "c.client.pl"]
+    added = []
+
+    def add(current, new):
+        host = new.get_payload("domain")
+        if host == "b.client.pl" and "failed-once" not in added:
+            added.append("failed-once")
+            raise ConnectionError("redis hiccup while sending the task")
+        added.append(host)
+        return True
+
+    scanner.add_task_if_domain_exists = add
+    root = _with_root(_domain_task("client.pl"))
+    with mock.patch("artemis.module_base.ArtemisBase.add_task"):
+        scanner.run_multiple([root])
+        scanner.run_multiple([root])  # retry of the same task
+        scanner.run_multiple([root])  # nothing failed in the retry: done for this analysis
+    assert added == ["a.client.pl", "failed-once", "c.client.pl", "a.client.pl", "b.client.pl", "c.client.pl"]
+
+
+def test_fallback_discovery_path_adds_the_known_hosts(_ports_env):  # noqa: F811
+    """Inverted second-review proof N2b."""
+    scanner = _port_scanner()
+    _fake_redis(scanner)
+    scanner._stock_results.known_hosts.return_value = ["shop.client.pl"]
+    scanner.add_task_if_domain_exists = mock.Mock(return_value=True)
+    root = _with_root(_domain_task("client.pl"))
+    with mock.patch("cybercover.modules.cybercover_port_scanner.installed_templates_version", return_value=None), \
+            mock.patch("artemis.modules.port_scanner.PortScanner.run_multiple") as stock:
+        scanner.run_multiple([root])
+    stock.assert_called_once()
+    assert [c.args[1].get_payload("domain") for c in scanner.add_task_if_domain_exists.call_args_list] == [
+        "shop.client.pl"
+    ]
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+def test_known_hosts_through_real_artemis_add_task(_ports_env, stopped):  # noqa: F811
+    """Test gap 4: the emitted DOMAIN task keeps original_target (client key, port adoption), and a
+    stopped analysis gets no tasks."""
+    from karton.core import Task
+
+    scanner = _port_scanner()
+    _fake_redis(scanner)
+    scanner._store.replace("client.pl", "client.pl", "v10.5.0", [(443, "http", True)])
+    scanner._stock_results.known_hosts.return_value = ["shop.client.pl"]
+    scanner.db = mock.Mock()
+    scanner.db.get_analysis_by_id.return_value = {"stopped": stopped}
+    scanner.send_task = mock.Mock()
+    scanner.check_domain_exists_or_is_placeholder = mock.Mock(return_value=True)
+    root = Task({"type": "domain"}, payload={"domain": "client.pl"},
+                payload_persistent={"original_target": "client.pl"})
+    scanner.run_multiple([root])
+    sent = [call.args[0] for call in scanner.send_task.call_args_list]
+    domains = [task for task in sent if task.headers["type"] == "domain"]
+    if stopped:
+        assert sent == []
+    else:
+        assert [task.payload["domain"] for task in domains] == ["shop.client.pl"]
+        assert domains[0].payload_persistent["original_target"] == "client.pl"
+        assert domains[0].root_uid == root.root_uid
