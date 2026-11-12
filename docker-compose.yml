@@ -1,0 +1,57 @@
+# Cybercover incremental scanning services.
+#
+# Artemis' scripts/start (via scripts/find_docker_compose_files) automatically includes every
+# */docker-compose.yml next to its own docker-compose.yaml, so cloning this repository as
+# Artemis/cybercover_incremental is enough - Artemis' docker-compose.yaml is never modified.
+# In --mode=development, scripts/start generates docker-compose.dev.yml from this file.
+#
+# Paths are relative to the Artemis directory (the compose project directory).
+# YAML anchors cannot be shared across compose files, so the relevant parts of Artemis'
+# x-artemis-build-or-image / x-logging anchors are repeated here.
+
+x-cybercover-artemis-image:
+  &cybercover-artemis-image
+  image: "${ARTEMIS_BUILD_IMAGE:-certpl/artemis:latest}"
+  dns_opt:
+    - ndots:0
+  logging:
+    options:
+      max-size: "20m"
+      max-file: "1"
+
+services:
+  karton-cybercover-nuclei:
+    <<: *cybercover-artemis-image
+    command: "python3 -m cybercover.modules.cybercover_nuclei"
+    labels:
+      prometheus.port: "9001"
+    env_file: .env
+    environment:
+      PYTHONPATH: /opt
+    restart: always
+    volumes:
+      - "${CYBERCOVER_DIR:-./cybercover_incremental/cybercover}:/opt/cybercover:ro"
+      - "${DOCKER_COMPOSE_ADDITIONAL_SHARED_DIRECTORY:-./shared}:/shared/"
+      # Shared with Artemis' karton-nuclei: the same installed nuclei-templates release.
+      - data-nuclei-templates:/root/nuclei-templates
+      - data-nuclei-config:/root/.config/nuclei
+
+  karton-cybercover-port-scanner:
+    <<: *cybercover-artemis-image
+    command: "python3 -m cybercover.modules.cybercover_port_scanner"
+    labels:
+      prometheus.port: "9001"
+    env_file: .env
+    environment:
+      PYTHONPATH: /opt
+    restart: always
+    volumes:
+      - "${CYBERCOVER_DIR:-./cybercover_incremental/cybercover}:/opt/cybercover:ro"
+      - "${DOCKER_COMPOSE_ADDITIONAL_SHARED_DIRECTORY:-./shared}:/shared/"
+      # Read-only: used to determine the installed nuclei-templates release.
+      - data-nuclei-config:/root/.config/nuclei:ro
+
+# Declared by Artemis' docker-compose.yaml; repeated so this file also validates on its own.
+volumes:
+  data-nuclei-templates:
+  data-nuclei-config:

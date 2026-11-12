@@ -1,0 +1,41 @@
+# Isolated TEST stack for this repo only (Artemis image + throwaway Redis/PostgreSQL).
+# Not related to Artemis' docker-compose.yaml and never picked up by Artemis' scripts/start.
+# Run via tests/run_in_docker.sh.
+services:
+  test:
+    image: "${ARTEMIS_BUILD_IMAGE:-certpl/artemis:latest}"
+    entrypoint: ""
+    working_dir: /opt/cybercover_incremental
+    command: ["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"]
+    environment:
+      PYTHONPATH: /opt/cybercover_incremental:/opt
+      PYTHONDONTWRITEBYTECODE: "1"
+      POSTGRES_CONN_STR: postgresql+psycopg2://postgres:postgres@postgres/artemis
+      REDIS_CONN_STR: redis://redis:6379/1
+      DB_CONN_STR: mongodb://unused  # legacy setting Artemis still requires; not used
+    tmpfs:
+      - /data
+    volumes:
+      - ..:/opt/cybercover_incremental:ro
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.0.5
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: artemis
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d artemis"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

@@ -17,6 +17,7 @@ RAW = f"https://raw.githubusercontent.com/{REPO}"
 TEMPLATES_CONFIG_PATH = os.path.expanduser("~/.config/nuclei/.templates-config.json")
 CACHE_TTL = 30 * 24 * 60 * 60
 RELEASE_CHECK_TTL = 24 * 60 * 60
+LAST_KNOWN_RELEASE_KEY = "cybercover:last-known-release"
 VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 log = logging.getLogger(__name__)
@@ -89,11 +90,22 @@ def _validate_template_path(path: str) -> str:
 
 
 def _parse_additions(data: bytes) -> Set[str]:
+    """Parse a .new-additions list. Invalid entries (non-YAML files, absolute or ``..`` paths) are
+    skipped with a warning rather than failing every customer's scan; a skipped path is never
+    fetched or written to disk."""
     try:
         lines = data.decode("utf-8").splitlines()
     except UnicodeDecodeError as exc:
         raise TemplateLookupError("Invalid UTF-8 in nuclei-templates .new-additions") from exc
-    return {_validate_template_path(line.strip()) for line in lines if line.strip()}
+    paths: Set[str] = set()
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            paths.add(_validate_template_path(line.strip()))
+        except TemplateLookupError as exc:
+            log.warning("Skipping entry of .new-additions: %s", exc)
+    return paths
 
 
 def get_daily_additions(
@@ -172,6 +184,21 @@ def latest_release(
     except ValueError as exc:
         raise TemplateLookupError(str(exc)) from exc
     _cache_set(cache_set, key, version.encode("utf-8"), RELEASE_CHECK_TTL)
+    _cache_set(cache_set, LAST_KNOWN_RELEASE_KEY, version.encode("utf-8"), CACHE_TTL)
+    return version
+
+
+def last_known_release(cache_get: CacheGet) -> Optional[str]:
+    """The newest release seen by ``latest_release`` in the last 30 days, for use while GitHub is
+    unreachable (so callers don't fall back to an older installed release and flip-flop)."""
+    cached = cache_get(LAST_KNOWN_RELEASE_KEY)
+    if cached is None:
+        return None
+    version = cached.decode("utf-8")
+    try:
+        parse_version(version)
+    except ValueError:
+        return None
     return version
 
 
@@ -187,7 +214,12 @@ def get_template_contents(
     session = session or requests.Session()
     contents: dict[str, bytes] = {}
     for path in sorted(paths):
-        path = _validate_template_path(path)
+        try:
+            path = _validate_template_path(path)
+        except TemplateLookupError as exc:
+            # Normally removed when the list is fetched; also skip it here (e.g. a corrupted cache).
+            log.warning("Skipping template: %s", exc)
+            continue
         key = f"cybercover:template:{day.isoformat()}:{version}:{path}"
         cached = cache_get(key)
         if cached is not None:

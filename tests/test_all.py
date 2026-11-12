@@ -68,18 +68,17 @@ def test_daily_additions_is_cached_by_date_and_release():
     assert ttl == [CACHE_TTL]
 
 
-@pytest.mark.parametrize("bad_path", ["../outside.yaml", "/absolute.yaml", "http/README.md"])
-def test_additions_reject_invalid_paths(bad_path):
+@pytest.mark.parametrize("bad_path", ["../outside.yaml", "/absolute.yaml", "http/README.md", "http/../x.yaml"])
+def test_additions_skip_invalid_paths(bad_path):
     cache = {}
-    session = FakeSession(f"{bad_path}\n".encode())
-    with pytest.raises(TemplateLookupError):
-        get_daily_additions(
-            datetime.date(2026, 11, 5),
-            "v10.5.1",
-            cache.get,
-            lambda k, v, timeout=None: _cache_set(cache, k, v),
-            session,
-        )
+    session = FakeSession(f"{bad_path}\nhttp/ok.yaml\n".encode())
+    assert get_daily_additions(
+        datetime.date(2026, 11, 5),
+        "v10.5.1",
+        cache.get,
+        lambda k, v, timeout=None: _cache_set(cache, k, v),
+        session,
+    ) == {"http/ok.yaml"}
 
 
 def test_template_selection_for_first_scan_and_release_transition():
@@ -175,11 +174,10 @@ def test_installed_version(tmp_path):
 
 def test_state_store_roundtrip():
     store = ScanStateStore(engine=create_engine("sqlite://"))
-    assert store.get_states(["a:80"]) == {}
-    store.set_versions(["a:80", "b:443"], "v10.5.0")
-    states = store.get_states(["a:80", "b:443", "c:1"])
-    assert {target: value[0] for target, value in states.items()} == {"a:80": "v10.5.0", "b:443": "v10.5.0"}
-    assert all(isinstance(value[1], datetime.datetime) for value in states.values())
+    assert store.get_states([("c1", "a", 80)]) == {}
+    store.set_versions([("c1", "a", 80), ("c1", "b", 443)], "v10.5.0", DAY)
+    states = store.get_states([("c1", "a", 80), ("c1", "b", 443), ("c1", "c", 1), ("c2", "a", 80)])
+    assert states == {("c1", "a", 80): ("v10.5.0", DAY), ("c1", "b", 443): ("v10.5.0", DAY)}
 
 
 def _module():
@@ -191,7 +189,7 @@ def _module():
     module.cache = mock.Mock()
     module.cache.get.return_value = None
     module.save_task_result = mock.Mock()
-    module.lock = mock.MagicMock()
+    module._shared_templates_lock = mock.MagicMock()
     module._incremental = False
     module._scanned_categories = set()
     module._nuclei_failures = 0
@@ -202,13 +200,29 @@ def _module():
     return module
 
 
-def _stored_version(module, target):
-    return module.state.get_states([target])[target][0]
+DAY = datetime.date(2026, 11, 5)
 
 
-def _task(host, port=80):
+def _key(host, port=80, client=None):
+    return (client or host, host, port)
+
+
+def _stored(module, host, port=80, client=None):
+    return module.state.get_states([_key(host, port, client)]).get(_key(host, port, client))
+
+
+def _stored_version(module, host, port=80, client=None):
+    return _stored(module, host, port, client)[0]
+
+
+def _set_state(module, host, version, port=80, client=None, snapshot_date=DAY):
+    module.state.set_versions([_key(host, port, client)], version, snapshot_date)
+
+
+def _task(host, port=80, client=None):
     task = mock.Mock()
     task.get_payload.side_effect = {"host": host, "port": port}.get
+    task.payload_persistent = {"original_target": client or host}
     return task
 
 
@@ -277,7 +291,7 @@ def test_new_release_runs_nuclei_template_updater():
         "cybercover.modules.cybercover_nuclei.latest_release", return_value="v10.6.0"
     ), mock.patch(
         "cybercover.modules.cybercover_nuclei.installed_templates_version",
-        return_value="v10.6.0",
+        side_effect=["v10.5.1", "v10.6.0"],
     ), mock.patch(
         "cybercover.modules.cybercover_nuclei.directory_backup"
     ) as backup, mock.patch(
@@ -311,7 +325,7 @@ def test_no_changes_saves_success_and_advances_state():
     ):
         module._run_group([task], "v10.5.1", day, "v10.5.1", day, set())
     assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.OK
-    assert _stored_version(module, "example.com:80") == "v10.5.1"
+    assert _stored_version(module, "example.com") == "v10.5.1"
 
 
 def test_run_group_keeps_state_if_template_lookup_fails():
@@ -319,7 +333,7 @@ def test_run_group_keeps_state_if_template_lookup_fails():
 
     module = _module()
     task = _task("example.com")
-    module.state.set_versions(["example.com:80"], "v10.5.0")
+    _set_state(module, "example.com", "v10.5.0")
     day = datetime.date(2026, 11, 5)
     with mock.patch(
         "cybercover.modules.cybercover_nuclei.templates_to_scan",
@@ -327,7 +341,7 @@ def test_run_group_keeps_state_if_template_lookup_fails():
     ):
         module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
     assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.ERROR
-    assert _stored_version(module, "example.com:80") == "v10.5.0"
+    assert _stored_version(module, "example.com") == "v10.5.0"
 
 
 def test_run_group_scans_cached_yaml_then_saves_version(tmp_path):
@@ -351,7 +365,7 @@ def test_run_group_scans_cached_yaml_then_saves_version(tmp_path):
 
         module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
     assert scan.call_count == 1
-    assert _stored_version(module, "example.com:80") == "v10.5.1"
+    assert _stored_version(module, "example.com") == "v10.5.1"
 
 
 def test_missing_template_on_main_is_skipped():
@@ -386,7 +400,7 @@ def test_failed_nuclei_run_does_not_advance_state():
 
     module = _module()
     task = _task("example.com")
-    module.state.set_versions(["example.com:80"], "v10.5.0")
+    _set_state(module, "example.com", "v10.5.0")
     day = datetime.date(2026, 11, 5)
 
     def failing_run(tasks):
@@ -407,7 +421,7 @@ def test_failed_nuclei_run_does_not_advance_state():
         side_effect=CalledProcessErrorWithMessage("boom", 1, ["nuclei"], b"", b"boom"),
     ):
         module._run_group([task], "v10.5.0", day, "v10.5.1", day, {"http/a.yaml"})
-    assert _stored_version(module, "example.com:80") == "v10.5.0"
+    assert _stored_version(module, "example.com") == "v10.5.0"
 
 
 def _port_scanner():
@@ -416,6 +430,8 @@ def _port_scanner():
 
     scanner = CybercoverPortScanner.__new__(CybercoverPortScanner)
     scanner._store = DiscoveryStore(engine=create_engine("sqlite://"))
+    scanner._stock_results = mock.Mock()
+    scanner._stock_results.latest.return_value = None
     scanner._capture = None
     scanner.cache = mock.Mock()
     scanner.save_task_result = mock.Mock()
@@ -481,7 +497,10 @@ def test_known_host_without_new_release_replays_endpoints_without_scanning(_port
     assert [t.get_payload("port") for t in created] == [443, 8080]
     assert [t.get_payload("ssl") for t in created] == [True, False]
     assert scanner.save_task_result.call_args.kwargs["data"] == {
-        "www.client.pl": {"443": {"service": "http", "ssl": True}, "8080": {"service": "http", "ssl": False}}
+        "www.client.pl": {
+            "443": {"service": "http", "ssl": True, "source": "replayed"},
+            "8080": {"service": "http", "ssl": False, "source": "replayed"},
+        }
     }
 
 
@@ -551,7 +570,8 @@ def test_filter_keeps_only_high_and_critical_without_headless():
         "http/mixed.yaml": _template("critical", "http: []\nheadless:\n  - steps: []\n"),
         "http/info.yaml": _template("info"),
     }
-    selected, _ = filter_templates(contents, {"high", "critical"})
+    selected, _, skipped = filter_templates(contents, {"high", "critical"})
+    assert skipped == {}
     assert set(selected) == {"http/high.yaml", "dast/critical.yaml"}
 
 
@@ -591,15 +611,20 @@ def test_lower_runtime_threshold_cannot_enable_medium():
     ), mock.patch("artemis.modules.nuclei.Nuclei.run_multiple") as scan:
         module._run_group([_task("example.com")], "v10.5.1", day, "v10.5.1", day, set())
     scan.assert_not_called()
-    assert _stored_version(module, "example.com:80") == "v10.5.1"
+    assert _stored_version(module, "example.com") == "v10.5.1"
 
 
-@pytest.mark.parametrize("content", [b"info: [", b"info: {}", b"info: {severity: [high]}"])
-def test_invalid_metadata_is_an_error(content):
+@pytest.mark.parametrize(
+    "content", [b"info: [", b"info: {}", b"info: {severity: [high]}", b"info: {severity: high, tags: 5}"]
+)
+def test_invalid_template_is_skipped_without_blocking_others(content):
     from cybercover.modules.cybercover_nuclei import filter_templates
 
-    with pytest.raises(TemplateLookupError):
-        filter_templates({"http/a.yaml": content}, {"high", "critical"})
+    selected, _, skipped = filter_templates(
+        {"http/bad.yaml": content, "http/good.yaml": _template("high")}, {"high", "critical"}
+    )
+    assert set(selected) == {"http/good.yaml"}
+    assert set(skipped) == {"http/bad.yaml"}
 
 
 def test_all_filtered_templates_save_success_and_advance_state():
@@ -618,7 +643,7 @@ def test_all_filtered_templates_save_success_and_advance_state():
     scan.assert_not_called()
     assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.OK
     assert "No eligible" in module.save_task_result.call_args.kwargs["status_reason"]
-    assert _stored_version(module, "example.com:80") == "v10.5.1"
+    assert _stored_version(module, "example.com") == "v10.5.1"
 
 
 def test_release_list_is_filtered_for_first_scan_and_release_transition(tmp_path):
@@ -651,25 +676,23 @@ def test_release_list_is_filtered_for_first_scan_and_release_transition(tmp_path
             )
             module._run_group([task], last_version, day, "v10.5.1", day, {"http/high.yaml"})
         scan.assert_called_once()
-        assert _stored_version(module, "example.com:80") == "v10.5.1"
+        assert _stored_version(module, "example.com") == "v10.5.1"
 
 
-def test_missing_release_list_and_bad_template_do_not_advance_state(tmp_path):
+def test_missing_release_list_does_not_advance_state(tmp_path):
     from artemis.binds import TaskStatus
 
-    day = datetime.date(2026, 11, 5)
-    for native, contents in ((True, {}), (False, {"http/a.yaml": b"info: ["})):
-        module = _module()
-        task = _task("example.com")
-        module.state.set_versions(["example.com:80"], "v10.5.0")
-        with mock.patch(
-            "cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(tmp_path) + "/"
-        ), mock.patch(
-            "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=(set(contents), native)
-        ), mock.patch("cybercover.modules.cybercover_nuclei.get_template_contents", return_value=contents):
-            module._run_group([task], "v10.5.0", day, "v10.5.1", day, set(contents))
-        assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.ERROR
-        assert _stored_version(module, "example.com:80") == "v10.5.0"
+    module = _module()
+    task = _task("example.com")
+    _set_state(module, "example.com", "v10.5.0")
+    with mock.patch(
+        "cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(tmp_path) + "/"
+    ), mock.patch(
+        "cybercover.modules.cybercover_nuclei.templates_to_scan", return_value=(set(), True)
+    ), mock.patch("cybercover.modules.cybercover_nuclei.get_template_contents", return_value={}):
+        module._run_group([task], "v10.5.0", DAY, "v10.5.1", DAY, set())
+    assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.ERROR
+    assert _stored_version(module, "example.com") == "v10.5.0"
 
 
 def test_release_list_with_only_ineligible_templates_skips_nuclei(tmp_path):
@@ -691,7 +714,7 @@ def test_release_list_with_only_ineligible_templates_skips_nuclei(tmp_path):
         module._run_group([task], None, None, "v10.5.1", day, set())
     scan.assert_not_called()
     assert module.save_task_result.call_args.kwargs["status"] == TaskStatus.OK
-    assert _stored_version(module, "example.com:80") == "v10.5.1"
+    assert _stored_version(module, "example.com") == "v10.5.1"
 
 
 def test_router_excluded_tags_skip_empty_batch():
@@ -755,7 +778,7 @@ def test_real_nuclei_runs_only_selected_templates(tmp_path, monkeypatch):
         "http/medium.yaml": nuclei_template("excluded-medium", "medium"),
         "headless/high.yaml": nuclei_template("excluded-headless", "high", "headless: []\n"),
     }
-    selected, tags = filter_templates(candidates, {"high", "critical"})
+    selected, tags, _ = filter_templates(candidates, {"high", "critical"})
     module = _module()
     module._incremental = True
     module._template_tags = tags
