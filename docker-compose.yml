@@ -58,8 +58,9 @@ services:
   # - karton-shodan_vulns: needs SHODAN_API_KEY (paid plan for commercial use); unverified,
   #   banner-based CVEs and no Artemis reporter.
   # - karton-removed_domain_existing_vhost: needs a passive DNS source (CIRCL: trusted partners only).
-  # If upstream removes one of these services, `docker compose config` fails on this entry
-  # ("neither an image nor a build context") - delete the entry then.
+  # If upstream removes one of these services, compose ignores the entry here (harmless). If upstream
+  # restores the api_scanner module, we would keep disabling it silently: see the check in the README
+  # ("Upgrading Artemis", step 5).
   karton-api_scanner:
     profiles: ["cybercover-disabled"]
   karton-shodan_vulns:

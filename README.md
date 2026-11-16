@@ -207,9 +207,11 @@ commit `8a79b34` (`certpl/artemis:latest` of 2026-11-12). After pulling a new Ar
    update, adopted or replayed ports, number of selected templates).
 4. Check that `MODULES_DISABLED_BY_DEFAULT` in `.env` still contains Artemis' current default list
    plus the two Cybercover modules (see Deployment).
-5. Run `docker compose $(scripts/find_docker_compose_files --docker-compose-string) config -q`. If it
-   fails with "neither an image nor a build context", upstream removed one of the services disabled in
-   our `docker-compose.yml` (see Deployment): delete that entry.
+5. Check whether upstream restored the `api_scanner` module, which our `docker-compose.yml` disables
+   (see Deployment). From the Artemis directory:
+   `ls artemis/modules/api_scanner.py`. If the file exists again, decide whether to enable the module
+   and remove its entry from our `docker-compose.yml`. Nothing else needs checking: if upstream
+   removes any of the three disabled services from its compose file, our entry is simply ignored.
 
 ## Tests
 
