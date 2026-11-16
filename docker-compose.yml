@@ -51,6 +51,22 @@ services:
       # Read-only: used to determine the installed nuclei-templates release.
       - data-nuclei-config:/root/.config/nuclei:ro
 
+  # Stock Artemis services disabled for Cybercover (a service in a profile that is not activated is
+  # never started). Without this they restart forever:
+  # - karton-api_scanner: the module was removed upstream (Artemis b8e7300f) but its service is still
+  #   in Artemis' docker-compose.yaml. Remove this entry once upstream drops the service.
+  # - karton-shodan_vulns: needs SHODAN_API_KEY (paid plan for commercial use); unverified,
+  #   banner-based CVEs and no Artemis reporter.
+  # - karton-removed_domain_existing_vhost: needs a passive DNS source (CIRCL: trusted partners only).
+  # If upstream removes one of these services, `docker compose config` fails on this entry
+  # ("neither an image nor a build context") - delete the entry then.
+  karton-api_scanner:
+    profiles: ["cybercover-disabled"]
+  karton-shodan_vulns:
+    profiles: ["cybercover-disabled"]
+  karton-removed_domain_existing_vhost:
+    profiles: ["cybercover-disabled"]
+
 # Declared by Artemis' docker-compose.yaml; repeated so this file also validates on its own.
 volumes:
   data-nuclei-templates:

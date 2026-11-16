@@ -167,6 +167,19 @@ SQLAlchemy metadata, outside Artemis' Alembic migrations:
    module errors the reports service uses for completeness. Optional:
    `CYBERCOVER_FULL_SCAN_HOSTS_MAX_AGE_DAYS` (default `40`; keep it at or below the archiver age) and
    `CYBERCOVER_FULL_SCAN_HOSTS_LIMIT` (default `500`).
+6. `docker-compose.yml` also disables three stock services by putting them in the
+   `cybercover-disabled` profile, which is never activated, so they are not started:
+   - `karton-api_scanner`: the module was removed upstream, but its service is still in Artemis'
+     compose file.
+   - `karton-shodan_vulns`: needs `SHODAN_API_KEY`, which requires a paid plan for commercial use.
+     Its CVEs are inferred from service banners and Artemis has no reporter for it.
+   - `karton-removed_domain_existing_vhost`: needs a passive DNS source, and CIRCL gives access only
+     to trusted partners.
+
+   On an existing installation, `./scripts/start` does not stop containers that are already running:
+   remove them once with `docker rm -f artemis-karton-api_scanner-1 artemis-karton-shodan_vulns-1
+   artemis-karton-removed_domain_existing_vhost-1`. To run one of them anyway, add
+   `--profile cybercover-disabled` to the compose command.
 
 The Nuclei HTML reporter ignores results from this module (it accepts only `nuclei` and
 `nuclei-module`), but `/api/task-results?only_interesting=false` returns them.
@@ -194,6 +207,9 @@ commit `8a79b34` (`certpl/artemis:latest` of 2026-11-12). After pulling a new Ar
    update, adopted or replayed ports, number of selected templates).
 4. Check that `MODULES_DISABLED_BY_DEFAULT` in `.env` still contains Artemis' current default list
    plus the two Cybercover modules (see Deployment).
+5. Run `docker compose $(scripts/find_docker_compose_files --docker-compose-string) config -q`. If it
+   fails with "neither an image nor a build context", upstream removed one of the services disabled in
+   our `docker-compose.yml` (see Deployment): delete that entry.
 
 ## Tests
 
