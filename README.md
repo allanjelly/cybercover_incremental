@@ -176,10 +176,10 @@ SQLAlchemy metadata, outside Artemis' Alembic migrations:
    - `karton-removed_domain_existing_vhost`: needs a passive DNS source, and CIRCL gives access only
      to trusted partners.
 
-   On an existing installation, `./scripts/start` does not stop containers that are already running:
-   remove them once with `docker rm -f artemis-karton-api_scanner-1 artemis-karton-shodan_vulns-1
-   artemis-karton-removed_domain_existing_vhost-1`. To run one of them anyway, add
-   `--profile cybercover-disabled` to the compose command.
+   On an existing installation, `compose up` does not remove containers of these services that are
+   already running; `./ops stop` removes them (and `./ops status` lists them as not part of the
+   compose files). To run one of them anyway, add `--profile cybercover-disabled` to the compose
+   command.
 
 The Nuclei HTML reporter ignores results from this module (it accepts only `nuclei` and
 `nuclei-module`), but `/api/task-results?only_interesting=false` returns them.
@@ -194,19 +194,11 @@ Do not use Artemis' `./scripts/start` in either mode:
   in every Artemis-based container (these services included) and publishes PostgreSQL on port 5432 on
   all interfaces. It is meant for developing Artemis itself.
 
-Until the ops tooling exists, start Artemis at the pinned image, from the Artemis directory checked
-out at the same commit:
+Start, stop and check Artemis with [cybercover_ops](https://github.com/allanjelly/cybercover_ops)
+(`./ops start`, `./ops stop`, `./ops status`), cloned into the Artemis directory like this repository.
+It runs every component at the versions pinned in its lock file.
 
-```sh
-ARTEMIS_COMMIT=8a79b34ca808a973d34a4ad713272cecc176e1a7
-docker pull certpl/artemis:$ARTEMIS_COMMIT
-docker tag certpl/artemis:$ARTEMIS_COMMIT certpl/artemis:latest   # Artemis-modules-extra builds FROM it
-docker compose $(scripts/find_docker_compose_files --mode=production --docker-compose-string) \
-  --profile not-arm up -d --remove-orphans --build
-```
-
-`--build` here only builds the Artemis-modules-extra images (unpinned content, see the upgrade
-requirements). Development of these modules needs no special mode: their code is mounted read-only
+Development of these modules needs no special mode: their code is mounted read-only
 from this checkout, so a change takes effect after `docker compose -p artemis restart <service>`.
 For the database, use `docker compose -p artemis exec postgres psql -U postgres artemis`.
 
