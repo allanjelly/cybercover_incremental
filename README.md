@@ -149,12 +149,12 @@ SQLAlchemy metadata, outside Artemis' Alembic migrations:
 ## Deployment
 
 1. Clone this repository as `cybercover_incremental` inside the Artemis directory (next to
-   Artemis' `docker-compose.yaml`) and run `./scripts/start` (or `--mode=development`). No Artemis
-   file is modified: Artemis' `scripts/find_docker_compose_files` automatically includes every
-   `*/docker-compose.yml`, so this repo's `docker-compose.yml` adds the `karton-cybercover-nuclei`
-   and `karton-cybercover-port-scanner` services (the same mechanism Artemis-modules-extra uses).
-   Development mode generates `docker-compose.dev.yml` from it. To mount the code from elsewhere,
-   set `CYBERCOVER_DIR` in `.env` (default `./cybercover_incremental/cybercover`).
+   Artemis' `docker-compose.yaml`) and start Artemis at a pinned image (see "Starting Artemis" below).
+   No Artemis file is modified: Artemis' `scripts/find_docker_compose_files` automatically includes
+   every `*/docker-compose.yml`, so this repo's `docker-compose.yml` adds the
+   `karton-cybercover-nuclei` and `karton-cybercover-port-scanner` services (the same mechanism
+   Artemis-modules-extra uses). To mount the code from elsewhere, set `CYBERCOVER_DIR` in `.env`
+   (default `./cybercover_incremental/cybercover`).
 2. Keep the module out of full scans by adding `cybercover_nuclei` to `MODULES_DISABLED_BY_DEFAULT`
    in `.env` (also `cybercover_port_scanner`). This variable replaces Artemis' default list, so repeat it:
    `MODULES_DISABLED_BY_DEFAULT=admin_panel_login_bruter,dangling_dns_detector,example,humble,leak_scanner,ssh_bruter,xss_scanner,cybercover_nuclei,cybercover_port_scanner`
@@ -184,11 +184,69 @@ SQLAlchemy metadata, outside Artemis' Alembic migrations:
 The Nuclei HTML reporter ignores results from this module (it accepts only `nuclei` and
 `nuclei-module`), but `/api/task-results?only_interesting=false` returns them.
 
+## Starting Artemis
+
+Do not use Artemis' `./scripts/start` in either mode:
+
+- `--mode=production` pulls `certpl/artemis:latest`, an uncontrolled upgrade to whatever CERT-Polska
+  built last;
+- `--mode=development` builds an unpinned image locally, mounts the whole Artemis checkout over `/opt`
+  in every Artemis-based container (these services included) and publishes PostgreSQL on port 5432 on
+  all interfaces. It is meant for developing Artemis itself.
+
+Until the ops tooling exists, start Artemis at the pinned image, from the Artemis directory checked
+out at the same commit:
+
+```sh
+ARTEMIS_COMMIT=8a79b34ca808a973d34a4ad713272cecc176e1a7
+docker pull certpl/artemis:$ARTEMIS_COMMIT
+docker tag certpl/artemis:$ARTEMIS_COMMIT certpl/artemis:latest   # Artemis-modules-extra builds FROM it
+docker compose $(scripts/find_docker_compose_files --mode=production --docker-compose-string) \
+  --profile not-arm up -d --remove-orphans --build
+```
+
+`--build` here only builds the Artemis-modules-extra images (unpinned content, see the upgrade
+requirements). Development of these modules needs no special mode: their code is mounted read-only
+from this checkout, so a change takes effect after `docker compose -p artemis restart <service>`.
+For the database, use `docker compose -p artemis exec postgres psql -U postgres artemis`.
+
+## Checking, stopping and restarting
+
+After starting, wait a few minutes and check that no container restarts. A momentary
+`docker ps --filter status=restarting` is not enough: a container in a restart loop is only sometimes
+in the restarting state. Check the restart counters instead; this must print nothing:
+
+```sh
+docker inspect -f '{{.Name}} {{.RestartCount}}' $(docker ps -aq) | awk '$2>0'
+```
+
+For a container listed there, `docker logs --tail=40 <name>` shows why it fails.
+
+To stop everything (Artemis, Artemis-modules-extra and these services, including containers of
+inactive profiles and the one-off `karton-logger-run-*` container), from the Artemis directory:
+
+```sh
+docker compose -p artemis down --remove-orphans
+```
+
+**Emergency stop**, when the server barely responds and `down` hangs (e.g. many containers in restart
+loops):
+
+1. Stop the restart loops: `docker update --restart=no $(docker ps -aq)`.
+2. `docker kill $(docker ps -q)`, then `docker compose -p artemis down --remove-orphans`.
+3. If `docker` commands hang too: `sudo systemctl restart docker`, check `docker ps` and repeat step 2
+   if containers came back. Last resort: reboot.
+4. Never add `-v` to `down` and never run `docker system prune --volumes`: the volumes hold the
+   database and the Nuclei templates.
+5. Fix the cause, then start again (see "Starting Artemis"); recreating the containers restores
+   their `restart: always` policy.
+
 ## Upgrading Artemis
 
 The modules subclass stock Artemis modules and rely on some of their internals, so an Artemis
 upgrade can break them without any Artemis file having been modified. Last verified against Artemis
-commit `8a79b34` (`certpl/artemis:latest` of 2026-11-12). After pulling a new Artemis version or image:
+commit `8a79b34` (image `certpl/artemis:8a79b34ca808a973d34a4ad713272cecc176e1a7`). After pulling a new
+Artemis version or image:
 
 1. Run the test suite against the new image (`ARTEMIS_BUILD_IMAGE=<new image> tests/run_in_docker.sh`).
 2. Check that these internals still exist and behave as described; review their diff since the last
@@ -206,7 +264,11 @@ commit `8a79b34` (`certpl/artemis:latest` of 2026-11-12). After pulling a new Ar
 3. Run one full and one incremental scan of a test target and check the worker logs (template
    update, adopted or replayed ports, number of selected templates).
 4. Check that `MODULES_DISABLED_BY_DEFAULT` in `.env` still contains Artemis' current default list
-   plus the two Cybercover modules (see Deployment).
+   plus the two Cybercover modules (see Deployment). Review the changes to Artemis' `env.example`
+   (`git diff <old commit> <new commit> -- env.example`) and apply them to `.env`: the tests use their
+   own configuration and do not catch them. Example: with SQLAlchemy 2.1 (Artemis `911150e1`),
+   `POSTGRES_CONN_STR=postgresql://...` selects the psycopg 3 driver, which the image does not
+   contain, so every module fails at startup; it must be `postgresql+psycopg2://...`.
 5. Check whether upstream restored the `api_scanner` module, which our `docker-compose.yml` disables
    (see Deployment). From the Artemis directory:
    `ls artemis/modules/api_scanner.py`. If the file exists again, decide whether to enable the module
