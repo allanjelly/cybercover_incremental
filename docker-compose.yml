@@ -1,9 +1,9 @@
 # Cybercover incremental scanning services.
 #
-# Artemis' scripts/start (via scripts/find_docker_compose_files) automatically includes every
-# */docker-compose.yml next to its own docker-compose.yaml, so cloning this repository as
-# Artemis/cybercover_incremental is enough - Artemis' docker-compose.yaml is never modified.
-# In --mode=development, scripts/start generates docker-compose.dev.yml from this file.
+# Artemis' scripts/find_docker_compose_files includes every */docker-compose.yml next to its own
+# docker-compose.yaml, so cloning this repository as Artemis/cybercover_incremental is enough - Artemis'
+# docker-compose.yaml is never modified. Start Artemis with cybercover_ops (./ops start), not with
+# scripts/start in either mode (see the cybercover_ops README).
 #
 # Paths are relative to the Artemis directory (the compose project directory).
 # YAML anchors cannot be shared across compose files, so the relevant parts of Artemis'
