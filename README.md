@@ -236,36 +236,29 @@ loops):
 ## Upgrading Artemis
 
 The modules subclass stock Artemis modules and rely on some of their internals, so an Artemis
-upgrade can break them without any Artemis file having been modified. Last verified against Artemis
-commit `8a79b34` (image `certpl/artemis:8a79b34ca808a973d34a4ad713272cecc176e1a7`). After pulling a new
-Artemis version or image:
+upgrade can break them without any Artemis file having been modified (example: Artemis `2fee327d`
+removed nuclei workflows and changed `Nuclei._scan`; this repository supports both versions since
+`e7e884b`). Last verified against Artemis `e5e0167` (and `8a79b34`).
 
-1. Run the test suite against the new image (`ARTEMIS_BUILD_IMAGE=<new image> tests/run_in_docker.sh`).
-2. Check that these internals still exist and behave as described; review their diff since the last
-   verified commit (`git diff 8a79b34 -- artemis/modules/nuclei.py artemis/modules/port_scanner.py ...`):
-   - `artemis.modules.nuclei`: `Nuclei.run_multiple` (scans the template list once per category, then
-     repeats it for homepage links), `Nuclei._scan(templates, scan_using, targets, ...)`, `_get_links`,
-     `NUCLEI_TEMPLATES_LOCATION`, `ScanUsing`, and the module-level
-     `check_output_log_on_error_with_stderr` (temporarily wrapped to detect failed Nuclei runs, which
-     the stock `_scan` swallows);
-   - `artemis.modules.port_scanner`: `PortScanner.run_multiple` and `add_task`, and the shape of its
-     task result (read from `task_result` to adopt full-scan ports);
-   - `artemis.resource_lock.ResourceLock` and the `nuclei-module` identity (the shared template lock);
-   - `artemis.db.TaskResult` columns (`receiver`, `target_string`, `status`, `task`, `result`,
-     `created_at`), and `original_target` in the task's `payload_persistent`.
-3. Run one full and one incremental scan of a test target and check the worker logs (template
-   update, adopted or replayed ports, number of selected templates).
-4. Check that `MODULES_DISABLED_BY_DEFAULT` in `.env` still contains Artemis' current default list
-   plus the two Cybercover modules (see Deployment). Review the changes to Artemis' `env.example`
-   (`git diff <old commit> <new commit> -- env.example`) and apply them to `.env`: the tests use their
-   own configuration and do not catch them. Example: with SQLAlchemy 2.1 (Artemis `911150e1`),
-   `POSTGRES_CONN_STR=postgresql://...` selects the psycopg 3 driver, which the image does not
-   contain, so every module fails at startup; it must be `postgresql+psycopg2://...`.
-5. Check whether upstream restored the `api_scanner` module, which our `docker-compose.yml` disables
-   (see Deployment). From the Artemis directory:
-   `ls artemis/modules/api_scanner.py`. If the file exists again, decide whether to enable the module
-   and remove its entry from our `docker-compose.yml`. Nothing else needs checking: if upstream
-   removes any of the three disabled services from its compose file, our entry is simply ignored.
+Upgrades go through cybercover_ops (`./ops update`), which, before anything is applied:
+
+- runs this repository's suite (`tests/run_in_docker.sh`) on the candidate's code and image, including
+  `tests/test_compat.py`: every `artemis` import and `Config` setting of the package must resolve, and
+  the stock methods the modules override or call (`Nuclei._scan`, `run_multiple`, `_get_links`,
+  `check_output_log_on_error_with_stderr`, `PortScanner.run_multiple`, `add_task`,
+  `add_task_if_domain_exists`, `save_task_result`, `ResourceLock`, the `nuclei-module` identity, the
+  `TaskResult` columns) must accept the arguments they pass;
+- checks the configuration: `MODULES_DISABLED_BY_DEFAULT` in `.env` must contain Artemis' current default
+  list plus the two Cybercover modules; `artemis/modules/api_scanner.py` must still be absent (our
+  `docker-compose.yml` disables its service); `AUTOARCHIVER_MIN_AGE_SECONDS_NOT_INTERESTING` must cover
+  `CYBERCOVER_FULL_SCAN_HOSTS_MAX_AGE_DAYS`;
+- shows the diff of Artemis' `env.example`, to apply to `.env` by hand (the tests use their own
+  configuration). Example: with SQLAlchemy 2.1 (Artemis `911150e1`), `POSTGRES_CONN_STR` must start
+  with `postgresql+psycopg2://`.
+
+What remains manual after an upgrade: one full and one incremental scan of a test target, checking the
+worker logs (template update, adopted or replayed ports, number of selected templates). To test this
+repository by hand against another image: `ARTEMIS_BUILD_IMAGE=<image> tests/run_in_docker.sh`.
 
 ## Tests
 
