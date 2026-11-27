@@ -11,6 +11,15 @@ from test_all import _ports_env  # noqa: F401 - shared fixture
 from test_all import DAY, _domain_task, _module, _port_scanner, _set_state, _stored, _task, _template
 
 
+
+def _scan_args() -> tuple:
+    """Nuclei._scan's scan_using argument, which Artemis removed in 2fee327d (workflows)."""
+    try:
+        from artemis.modules.nuclei import ScanUsing
+    except ImportError:
+        return ()
+    return (ScanUsing.TEMPLATES,)
+
 def _today():
     return datetime.datetime.now(datetime.timezone.utc).date()
 
@@ -227,7 +236,6 @@ def test_homepage_links_are_crawled_only_when_needed(incremental, homepage_list,
 
 
 def test_findings_from_main_templates_carry_repository_path():
-    from artemis.modules.nuclei import ScanUsing
 
     module = _module()
     module._incremental = True
@@ -239,7 +247,7 @@ def test_findings_from_main_templates_carry_repository_path():
         {"template-id": "installed", "template-path": "/root/nuclei-templates/http/a.yaml", "template": "http/a.yaml"},
     ]
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=raw):
-        findings = module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=[])
+        findings = module._scan([], *_scan_args(), ["https://example.com"], extra_nuclei_args=[])
     assert [f["template"] for f in findings] == ["http/cves/2026/CVE-2026-0001.yaml", "http/a.yaml"]
 
 

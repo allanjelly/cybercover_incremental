@@ -34,6 +34,15 @@ class FakeSession:
         return response
 
 
+
+def _scan_args() -> tuple:
+    """Nuclei._scan's scan_using argument, which Artemis removed in 2fee327d (workflows)."""
+    try:
+        from artemis.modules.nuclei import ScanUsing
+    except ImportError:
+        return ()
+    return (ScanUsing.TEMPLATES,)
+
 def _cache_set(cache, key, value, timeout=None):
     cache[key] = value
 
@@ -237,7 +246,6 @@ def _mock_log():
 
 
 def test_scan_supplies_filtered_custom_templates_without_native_nt(tmp_path):
-    from artemis.modules.nuclei import ScanUsing
 
     module = _module()
     custom = tmp_path / "custom.yaml"
@@ -248,7 +256,7 @@ def test_scan_supplies_filtered_custom_templates_without_native_nt(tmp_path):
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan(
             ["/root/nuclei-templates/http/old.yaml"],
-            ScanUsing.TEMPLATES,
+            *_scan_args(),
             ["https://example.com"],
             extra_nuclei_args=["-itags", "cve"],
         )
@@ -264,8 +272,20 @@ def test_scan_supplies_filtered_custom_templates_without_native_nt(tmp_path):
     ]
 
 
+def test_incremental_scan_never_runs_workflows():
+    try:
+        from artemis.modules.nuclei import ScanUsing
+    except ImportError:
+        pytest.skip("this Artemis has no workflows (removed in 2fee327d)")
+    module = _module()
+    module._incremental = True
+    module._custom_template_paths = {"http/custom.yaml": "/tmp/custom.yaml"}
+    with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
+        assert module._scan(["workflows/x.yaml"], ScanUsing.WORKFLOWS, ["https://example.com"]) == []
+    parent.assert_not_called()
+
+
 def test_scan_keeps_dast_templates_separate():
-    from artemis.modules.nuclei import ScanUsing
 
     module = _module()
     module._incremental = True
@@ -277,7 +297,7 @@ def test_scan_keeps_dast_templates_separate():
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
         module._scan(
             ["dast/old.yaml"],
-            ScanUsing.TEMPLATES,
+            *_scan_args(),
             ["https://example.com"],
             extra_nuclei_args=["-dast"],
         )
@@ -305,12 +325,11 @@ def test_new_release_runs_nuclei_template_updater():
 
 
 def test_empty_selection_does_not_invoke_nuclei():
-    from artemis.modules.nuclei import ScanUsing
 
     module = _module()
     module._incremental = True
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
-        module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=[])
+        module._scan([], *_scan_args(), ["https://example.com"], extra_nuclei_args=[])
     parent.assert_not_called()
 
 
@@ -379,17 +398,17 @@ def test_missing_template_on_main_is_skipped():
 
 
 def test_link_scan_uses_only_changed_templates_from_the_homepage_list_without_nt():
-    from artemis.modules.nuclei import NUCLEI_TEMPLATES_LOCATION, ScanUsing
+    from artemis.modules.nuclei import NUCLEI_TEMPLATES_LOCATION
 
     module = _module()
     module._incremental = True
     module._custom_template_paths = {"http/a.yaml": "/tmp/a.yaml", "http/b.yaml": "/tmp/b.yaml"}
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
-        module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=[])
+        module._scan([], *_scan_args(), ["https://example.com"], extra_nuclei_args=[])
         module._scan(
-            [NUCLEI_TEMPLATES_LOCATION + "http/b.yaml"], ScanUsing.TEMPLATES, ["https://example.com/x"], extra_nuclei_args=[]
+            [NUCLEI_TEMPLATES_LOCATION + "http/b.yaml"], *_scan_args(), ["https://example.com/x"], extra_nuclei_args=[]
         )
-        module._scan([NUCLEI_TEMPLATES_LOCATION + "http/other.yaml"], ScanUsing.TEMPLATES, ["https://example.com/y"])
+        module._scan([NUCLEI_TEMPLATES_LOCATION + "http/other.yaml"], *_scan_args(), ["https://example.com/y"])
     assert parent.call_count == 2
     assert sorted(parent.call_args_list[0].args[0]) == ["/tmp/a.yaml", "/tmp/b.yaml"]
     assert "-nt" not in parent.call_args_list[0].kwargs["extra_nuclei_args"]
@@ -535,26 +554,24 @@ def test_discovery_uses_latest_release_when_not_yet_installed(_ports_env):
 
 
 def test_dast_scan_uses_filtered_release_templates_without_nt():
-    from artemis.modules.nuclei import ScanUsing
 
     module = _module()
     module._incremental = True
     module._custom_template_paths = {"dast/new.yaml": "/tmp/dast/new.yaml"}
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
-        module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], use_fake_home=True, extra_nuclei_args=["-dast"])
+        module._scan([], *_scan_args(), ["https://example.com"], use_fake_home=True, extra_nuclei_args=["-dast"])
     assert parent.call_args.args[0] == ["/tmp/dast/new.yaml"]
     assert "-nt" not in parent.call_args.kwargs["extra_nuclei_args"]
 
 
 def test_dast_scan_without_any_templates_is_skipped(tmp_path):
-    from artemis.modules.nuclei import ScanUsing
 
     module = _module()
     module._incremental = True
     with mock.patch("cybercover.modules.cybercover_nuclei.NUCLEI_TEMPLATES_LOCATION", str(tmp_path) + "/"), mock.patch(
         "artemis.modules.nuclei.Nuclei._scan", return_value=[]
     ) as parent:
-        assert module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=["-dast"]) == []
+        assert module._scan([], *_scan_args(), ["https://example.com"], extra_nuclei_args=["-dast"]) == []
     parent.assert_not_called()
 
 
@@ -721,14 +738,13 @@ def test_release_list_with_only_ineligible_templates_skips_nuclei(tmp_path):
 
 
 def test_router_excluded_tags_skip_empty_batch():
-    from artemis.modules.nuclei import ScanUsing
 
     module = _module()
     module._incremental = True
     module._custom_template_paths = {"http/a.yaml": "/tmp/a.yaml"}
     module._template_tags = {"http/a.yaml": {"wordpress", "cve"}}
     with mock.patch("artemis.modules.nuclei.Nuclei._scan", return_value=[]) as parent:
-        module._scan([], ScanUsing.TEMPLATES, ["https://example.com"], extra_nuclei_args=["-etags", "wordpress"])
+        module._scan([], *_scan_args(), ["https://example.com"], extra_nuclei_args=["-etags", "wordpress"])
     parent.assert_not_called()
 
 
@@ -752,7 +768,6 @@ def test_real_nuclei_runs_only_selected_templates(tmp_path, monkeypatch):
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    from artemis.modules.nuclei import ScanUsing
     from cybercover.modules.cybercover_nuclei import filter_templates
 
     if not shutil.which("nuclei"):
@@ -786,7 +801,9 @@ def test_real_nuclei_runs_only_selected_templates(tmp_path, monkeypatch):
     module._incremental = True
     module._template_tags = tags
     module.requests_per_second_for_current_tasks = 0
+    # Set by the stock __init__; renamed in Artemis 2fee327d (workflows removed).
     module._nuclei_templates_or_workflows_to_skip_probabilistically_set = set()
+    module._nuclei_templates_to_skip_probabilistically_set = set()
     module._custom_template_paths = {}
     for path, content in selected.items():
         file = tmp_path / path
@@ -807,12 +824,15 @@ def test_real_nuclei_runs_only_selected_templates(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
+    # Since Artemis bd18aa5d Nuclei gets -restrict-local-network-access unless RUNNING_TESTS is set,
+    # and this test scans a server on 127.0.0.1.
+    monkeypatch.setenv("RUNNING_TESTS", "1")
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         findings = module._scan(
-            [], ScanUsing.TEMPLATES, [f"http://127.0.0.1:{server.server_port}"], extra_nuclei_args=[]
+            [], *_scan_args(), [f"http://127.0.0.1:{server.server_port}"], extra_nuclei_args=[]
         )
     finally:
         server.shutdown()

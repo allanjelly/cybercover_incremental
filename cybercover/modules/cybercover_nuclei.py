@@ -18,7 +18,14 @@ from artemis import load_risk_class
 from artemis.binds import TaskStatus
 from artemis.config import Config
 from artemis.modules import nuclei as nuclei_module
-from artemis.modules.nuclei import NUCLEI_TEMPLATES_LOCATION, Nuclei, ScanUsing
+from artemis.modules.nuclei import NUCLEI_TEMPLATES_LOCATION, Nuclei
+
+try:
+    # Artemis before 2fee327d ("remove workflow logic", 2026-11-23) scans templates and workflows:
+    # Nuclei._scan(templates_or_workflows, scan_using, targets, ...). Since then: _scan(templates, targets, ...).
+    from artemis.modules.nuclei import ScanUsing  # type: ignore[attr-defined]
+except ImportError:
+    ScanUsing = None  # type: ignore[assignment,misc]
 from artemis.resource_lock import ResourceLock
 from artemis.utils import CalledProcessErrorWithMessage, directory_backup
 
@@ -213,15 +220,15 @@ class CybercoverNuclei(Nuclei):
 
     def _scan(  # type: ignore[override]
         self,
-        templates_or_workflows: List[str],
-        scan_using: ScanUsing,
-        targets: List[str],
+        templates: List[str],
         *args: Any,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
+        """args are (scan_using, targets, ...) on Artemis before 2fee327d and (targets, ...) since;
+        they are passed on unchanged. Incremental scans never run workflows."""
         if not self._incremental:
-            return super()._scan(templates_or_workflows, scan_using, targets, *args, **kwargs)
-        if scan_using == ScanUsing.WORKFLOWS:
+            return super()._scan(templates, *args, **kwargs)
+        if ScanUsing is not None and args and args[0] == ScanUsing.WORKFLOWS:
             return []
         extra_nuclei_args = list(kwargs.get("extra_nuclei_args", []))
         is_dast = "-dast" in extra_nuclei_args
@@ -244,7 +251,7 @@ class CybercoverNuclei(Nuclei):
             local_path
             for path, local_path in self._custom_template_paths.items()
             if path.startswith("dast/") == is_dast
-            and (not is_link_scan or NUCLEI_TEMPLATES_LOCATION + path in templates_or_workflows)
+            and (not is_link_scan or NUCLEI_TEMPLATES_LOCATION + path in templates)
             and not (self._template_tags.get(path, set()) & excluded_tags)
         ]
         if self._severity_levels:
@@ -261,7 +268,7 @@ class CybercoverNuclei(Nuclei):
             "link" if is_link_scan else "main",
             len(selected),
         )
-        findings = super()._scan(selected, scan_using, targets, *args, **kwargs)
+        findings = super()._scan(selected, *args, **kwargs)
 
         # Templates from main run from a temporary directory; record their repository path like the
         # stock module does for installed templates, so reporters and deduplication see e.g.
